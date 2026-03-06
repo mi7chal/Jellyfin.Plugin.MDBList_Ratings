@@ -62,62 +62,65 @@ internal sealed class RateLimitStateStore
         }
     }
 
-    public async Task UpdateAsync(int? limit, int? remaining, DateTimeOffset? resetUtc, bool rateLimited, CancellationToken cancellationToken)
-    {
-        // If we are rate limited, we should not send more requests until reset time.
-        if (rateLimited)
-        {
-            // If reset is unknown, back off for 24h.
-            _state.NotBeforeUtc = resetUtc ?? DateTimeOffset.UtcNow.AddHours(24);
-        }
-        else
-        {
-            // Clear cooldown if it's in the past.
-            if (_state.NotBeforeUtc.HasValue && _state.NotBeforeUtc.Value <= DateTimeOffset.UtcNow)
-            {
-                _state.NotBeforeUtc = null;
-            }
-        }
+	public async Task UpdateAsync(int? limit, int? remaining, DateTimeOffset? resetUtc, bool rateLimited, CancellationToken cancellationToken)
+	{
+		var now = DateTimeOffset.UtcNow;
 
-        _state.LastLimit = limit ?? _state.LastLimit;
-        _state.LastRemaining = remaining ?? _state.LastRemaining;
-        _state.LastResetUtc = resetUtc ?? _state.LastResetUtc;
-        _state.UpdatedAtUtc = DateTimeOffset.UtcNow;
+		if (rateLimited)
+		{
+			// If reset is unknown, back off for 24h.
+			_state.NotBeforeUtc = resetUtc ?? now.AddHours(24);
+		}
+		else
+		{
+			var authoritativeQuotaAvailable = remaining.HasValue && remaining.Value > 0;
+			var cooldownExpired = _state.NotBeforeUtc.HasValue && _state.NotBeforeUtc.Value <= now;
 
-        try
-        {
-            var dir = Path.GetDirectoryName(_path);
-            if (!string.IsNullOrWhiteSpace(dir))
-            {
-                Directory.CreateDirectory(dir);
-            }
+			if (authoritativeQuotaAvailable || cooldownExpired)
+			{
+				_state.NotBeforeUtc = null;
+			}
+		}
 
-            var tmp = _path + ".tmp";
-            await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                await using (var fs = File.Create(tmp))
-                {
-                    await JsonSerializer.SerializeAsync(fs, _state, GetJsonOptions(), cancellationToken).ConfigureAwait(false);
-                }
+		_state.LastLimit = limit ?? _state.LastLimit;
+		_state.LastRemaining = remaining ?? _state.LastRemaining;
+		_state.LastResetUtc = resetUtc ?? _state.LastResetUtc;
+		_state.UpdatedAtUtc = now;
 
-                if (File.Exists(_path))
-                {
-                    File.Delete(_path);
-                }
+		try
+		{
+			var dir = Path.GetDirectoryName(_path);
+			if (!string.IsNullOrWhiteSpace(dir))
+			{
+				Directory.CreateDirectory(dir);
+			}
 
-                File.Move(tmp, _path);
-            }
-            finally
-            {
-                _ioLock.Release();
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to write rate-limit state file");
-        }
-    }
+			var tmp = _path + ".tmp";
+			await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+			try
+			{
+				await using (var fs = File.Create(tmp))
+				{
+					await JsonSerializer.SerializeAsync(fs, _state, GetJsonOptions(), cancellationToken).ConfigureAwait(false);
+				}
+
+				if (File.Exists(_path))
+				{
+					File.Delete(_path);
+				}
+
+				File.Move(tmp, _path);
+			}
+			finally
+			{
+				_ioLock.Release();
+			}
+		}
+		catch (Exception ex)
+		{
+			_logger.LogWarning(ex, "Failed to write rate-limit state file");
+		}
+	}
 
     private static JsonSerializerOptions GetJsonOptions() => new()
     {
