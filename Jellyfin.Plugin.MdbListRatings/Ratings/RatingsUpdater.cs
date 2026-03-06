@@ -539,20 +539,21 @@ internal sealed class RatingsUpdater
             }
         }
 
-        // If we are currently in cooldown and have no usable cache, stop the task.
-        if (_rateLimit.NotBeforeUtc.HasValue && _rateLimit.NotBeforeUtc.Value > now)
-        {
-            if (cached is not null)
-            {
-                // Use stale cache if available.
-                return new FetchResult { Data = cached.Data, Outcome = UpdateOutcome.Skipped };
-            }
+		// If a stored cooldown is active, prefer stale cache when available.
+		// If there is no cache, do one live request to revalidate the cooldown.
+		// This avoids getting stuck on a stale persisted cooldown state.
+		if (_rateLimit.NotBeforeUtc.HasValue && _rateLimit.NotBeforeUtc.Value > now)
+		{
+			if (cached is not null)
+			{
+				return new FetchResult { Data = cached.Data, Outcome = UpdateOutcome.Skipped };
+			}
 
-            _logger.LogWarning(
-                "MDBList rate limit cooldown is active until {NotBeforeUtc:o}. Stopping the task.",
-                _rateLimit.NotBeforeUtc.Value);
-            return new FetchResult { Data = null, Outcome = UpdateOutcome.RateLimited };
-        }
+			_logger.LogWarning(
+				"MDBList rate limit cooldown is active until {NotBeforeUtc:o}, but no cache is available for {Key}. Revalidating with a live request.",
+				_rateLimit.NotBeforeUtc.Value,
+				cacheKey);
+		}
 
         // Delay only when we are about to make a network request.
         if (cfg.RequestDelayMs > 0)
