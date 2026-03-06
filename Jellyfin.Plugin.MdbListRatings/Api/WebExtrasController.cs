@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.MdbListRatings.Configuration;
 using Jellyfin.Plugin.MdbListRatings.Ratings;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -15,7 +16,7 @@ namespace Jellyfin.Plugin.MdbListRatings.Api;
 
 /// <summary>
 /// Web-only "extras" for the Details all-ratings panel.
-/// These values are fetched live and are NOT saved anywhere.
+/// These values are fetched for the web UI and cached on disk to reduce repeated network requests.
 /// </summary>
 [ApiController]
 [Route("Plugins/MdbListRatings")]
@@ -49,7 +50,7 @@ public sealed class WebExtrasController : ControllerBase
     /// Returns live web-only extras for a TMDb id, based on cached MDBList response.
     /// - RottenTomatoes certified/verified badges: uses MDBList rating "url" to build RT page url.
     /// - Metacritic Must-See: uses MDBList ids.imdb (IMDb criticreviews).
-    /// - AniList: uses title+year search against AniList GraphQL (not saved).
+    /// - AniList: uses title+year search against AniList GraphQL (cached).
     /// </summary>
     [HttpGet("WebExtrasByTmdb")]
     [Produces("application/json")]
@@ -111,150 +112,189 @@ public sealed class WebExtrasController : ControllerBase
         http.DefaultRequestHeaders.UserAgent.ParseAdd("Jellyfin.Plugin.MdbListRatings/1.0");
 
         var res = new WebExtrasResponse();
+        var extrasCacheKey = $"{type}:{tmdbId.Trim()}";
+        var extrasCache = plugin.WebExtrasCache;
+        var extrasTtl = GetWebExtrasTtl(cfg);
+        var now = DateTimeOffset.UtcNow;
+
+        var cachedExtras = await extrasCache.TryGetAsync(extrasCacheKey, cancellationToken).ConfigureAwait(false)
+            ?? new WebExtrasCacheStore.CacheEnvelope();
+
+        ApplyCachedExtras(res, cachedExtras.Data);
+
+        var needRtRefresh = (wantTc || wantRv) && !HasFreshRottenTomatoesExtras(cachedExtras.Data, wantTc, wantRv, now, extrasTtl);
+        var needAniRefresh = wantAl && !HasFreshAniListExtra(cachedExtras.Data, now, extrasTtl);
+        var extrasChanged = false;
 
         // ---- RottenTomatoes: get page url from MDBList ratings[].url (tomatoes/popcorn) ----
-        string? rtPath = null;
-        try
+        if (needRtRefresh)
         {
-            if (env.Data?.Ratings is not null)
+            string? rtPath = null;
+            try
             {
-                foreach (var r in env.Data.Ratings)
+                if (env.Data?.Ratings is not null)
                 {
-                    var src = (r.Source ?? string.Empty).Trim();
-                    if (!src.Equals("tomatoes", StringComparison.OrdinalIgnoreCase) &&
-                        !src.Equals("popcorn", StringComparison.OrdinalIgnoreCase))
+                    foreach (var r in env.Data.Ratings)
                     {
-                        continue;
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(r.Url))
-                    {
-                        rtPath = r.Url;
-                        break;
-                    }
-                }
-            }
-
-            // Backward compatibility: old cache entries may not have Url in Data, but RawJson is available.
-            if (string.IsNullOrWhiteSpace(rtPath) && !string.IsNullOrWhiteSpace(env.RawJson))
-            {
-                using var doc = JsonDocument.Parse(env.RawJson);
-                if (doc.RootElement.TryGetProperty("ratings", out var arr) && arr.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var el in arr.EnumerateArray())
-                    {
-                        var src = el.TryGetProperty("source", out var s) ? s.GetString() : null;
-                        if (src is null) continue;
-
+                        var src = (r.Source ?? string.Empty).Trim();
                         if (!src.Equals("tomatoes", StringComparison.OrdinalIgnoreCase) &&
                             !src.Equals("popcorn", StringComparison.OrdinalIgnoreCase))
                         {
                             continue;
                         }
 
-                        if (el.TryGetProperty("url", out var u) && u.ValueKind == JsonValueKind.String)
+                        if (!string.IsNullOrWhiteSpace(r.Url))
                         {
-                            rtPath = u.GetString();
-                            if (!string.IsNullOrWhiteSpace(rtPath)) break;
+                            rtPath = r.Url;
+                            break;
+                        }
+                    }
+                }
+
+                // Backward compatibility: old cache entries may not have Url in Data, but RawJson is available.
+                if (string.IsNullOrWhiteSpace(rtPath) && !string.IsNullOrWhiteSpace(env.RawJson))
+                {
+                    using var doc = JsonDocument.Parse(env.RawJson);
+                    if (doc.RootElement.TryGetProperty("ratings", out var arr) && arr.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var el in arr.EnumerateArray())
+                        {
+                            var src = el.TryGetProperty("source", out var s) ? s.GetString() : null;
+                            if (src is null) continue;
+
+                            if (!src.Equals("tomatoes", StringComparison.OrdinalIgnoreCase) &&
+                                !src.Equals("popcorn", StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
+
+                            if (el.TryGetProperty("url", out var u) && u.ValueKind == JsonValueKind.String)
+                            {
+                                rtPath = u.GetString();
+                                if (!string.IsNullOrWhiteSpace(rtPath))
+                                {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            log.LogDebug(ex, "WebExtras: failed to extract RottenTomatoes url path from cache");
-        }
-
-        // Defensive: sometimes providers may return numeric "url" values. For RottenTomatoes we only accept
-        // URL-like strings (e.g. "/m/..." or full "https://...").
-        if (!string.IsNullOrWhiteSpace(rtPath))
-        {
-            var t = rtPath.Trim();
-            if (Regex.IsMatch(t, "^[0-9]+$"))
+            catch (Exception ex)
             {
-                rtPath = null;
+                log.LogDebug(ex, "WebExtras: failed to extract RottenTomatoes url path from cache");
             }
-        }
 
-        string? rtUrl = null;
-        if (!string.IsNullOrWhiteSpace(rtPath))
-        {
-            rtUrl = rtPath.StartsWith("http", StringComparison.OrdinalIgnoreCase)
-                ? rtPath
-                : "https://www.rottentomatoes.com" + (rtPath.StartsWith("/") ? rtPath : "/" + rtPath);
-        }
-
-        if ((wantTc || wantRv) && !string.IsNullOrWhiteSpace(rtUrl))
-        {
-            try
+            if (!string.IsNullOrWhiteSpace(rtPath))
             {
-                var html = await http.GetStringAsync(rtUrl, cancellationToken).ConfigureAwait(false);
-
-                // <script id="media-scorecard-json">...</script>
-                var m = Regex.Match(html, "<script\\s+id=\"media-scorecard-json\"[^>]*>([\\s\\S]*?)</script>", RegexOptions.IgnoreCase);
-                if (m.Success)
+                var t = rtPath.Trim();
+                if (Regex.IsMatch(t, "^[0-9]+$"))
                 {
-                    var jsonStr = m.Groups[1].Value;
+                    rtPath = null;
+                }
+            }
 
-                    if (wantTc)
+            string? rtUrl = null;
+            if (!string.IsNullOrWhiteSpace(rtPath))
+            {
+                rtUrl = rtPath.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                    ? rtPath
+                    : "https://www.rottentomatoes.com" + (rtPath.StartsWith("/") ? rtPath : "/" + rtPath);
+            }
+
+            var rtCriticsCertified = false;
+            var rtAudienceVerified = false;
+
+            if (!string.IsNullOrWhiteSpace(rtUrl))
+            {
+                try
+                {
+                    var html = await http.GetStringAsync(rtUrl, cancellationToken).ConfigureAwait(false);
+                    var m = Regex.Match(html, @"<script\s+id=""media-scorecard-json""[^>]*>([\s\S]*?)</script>", RegexOptions.IgnoreCase);
+                    if (m.Success)
                     {
+                        var jsonStr = m.Groups[1].Value;
+
                         try
                         {
                             var obj = JsonSerializer.Deserialize<RtScorecard>(jsonStr, JsonOptions);
-                            res.RtCriticsCertified = obj?.CriticsScore?.Certified == true;
+                            rtCriticsCertified = obj?.CriticsScore?.Certified == true;
                         }
                         catch
                         {
                             // ignore
                         }
-                    }
 
-                    if (wantRv)
-                    {
-                        // Same heuristic as the original userscript.
-                        res.RtAudienceVerified = jsonStr.Contains("POSITIVE\",\"certified\":true", StringComparison.OrdinalIgnoreCase);
+                        rtAudienceVerified = jsonStr.Contains("POSITIVE\",\"certified\":true", StringComparison.OrdinalIgnoreCase);
                     }
                 }
+                catch (Exception ex)
+                {
+                    log.LogDebug(ex, "WebExtras: RottenTomatoes extras failed for {Url}", rtUrl);
+                }
             }
-            catch (Exception ex)
-            {
-                log.LogDebug(ex, "WebExtras: RottenTomatoes extras failed for {Url}", rtUrl);
-            }
-        }
-// ---- Metacritic Must-See (from MDBList metacritic rating: score + votes) ----
-// MDBList typically provides:
-//   { "source":"metacritic", "score":100, "votes":16, ... }
-// We use: score > 80 AND votes >= 14.
-if (wantMc)
-{
-    try
-    {
-        var (mcScore, mcVotes) = TryGetMetacriticScoreVotes(env);
-        res.MetacriticMustSee = (mcScore > 80) && (mcVotes >= 14);
-    }
-    catch (Exception ex)
-    {
-        log.LogDebug(ex, "WebExtras: Metacritic Must-See extraction failed for type={Type} tmdbId={TmdbId}", type, tmdbId);
-    }
-}
 
-// ---- AniList meanScore (0..100) ----
-        // We deliberately DO NOT use Wikidata. We query AniList live using title+year.
-        if (wantAl && !string.IsNullOrWhiteSpace(title) && year.HasValue && year.Value > 0)
+            cachedExtras.Data.RottenTomatoesCachedAtUtc = now;
+            cachedExtras.Data.HasRtCriticsCertified = true;
+            cachedExtras.Data.RtCriticsCertified = rtCriticsCertified;
+            cachedExtras.Data.HasRtAudienceVerified = true;
+            cachedExtras.Data.RtAudienceVerified = rtAudienceVerified;
+
+            res.RtCriticsCertified = rtCriticsCertified;
+            res.RtAudienceVerified = rtAudienceVerified;
+            extrasChanged = true;
+        }
+
+        // ---- Metacritic Must-See (from MDBList metacritic rating: score + votes) ----
+        // MDBList typically provides:
+        //   { "source":"metacritic", "score":100, "votes":16, ... }
+        // We use: score > 80 AND votes >= 14.
+        if (wantMc)
         {
             try
             {
-                var score = await AniListTrySearchMeanScoreAsync(http, title!, year.Value, cancellationToken).ConfigureAwait(false);
-                if (score.HasValue && score.Value > 0)
-                {
-                    res.AniListScore = score.Value;
-                }
+                var (mcScore, mcVotes) = TryGetMetacriticScoreVotes(env);
+                res.MetacriticMustSee = (mcScore > 80) && (mcVotes >= 14);
             }
             catch (Exception ex)
             {
-                log.LogDebug(ex, "WebExtras: AniList failed for {Title} ({Year})", title, year);
+                log.LogDebug(ex, "WebExtras: Metacritic Must-See extraction failed for type={Type} tmdbId={TmdbId}", type, tmdbId);
             }
+        }
+
+        // ---- AniList meanScore (0..100) ----
+        // We deliberately DO NOT use Wikidata. We query AniList live using title+year.
+        if (needAniRefresh)
+        {
+            int? anilistScore = null;
+
+            if (!string.IsNullOrWhiteSpace(title) && year.HasValue && year.Value > 0)
+            {
+                try
+                {
+                    var score = await AniListTrySearchMeanScoreAsync(http, title!, year.Value, cancellationToken).ConfigureAwait(false);
+                    if (score.HasValue && score.Value > 0)
+                    {
+                        anilistScore = score.Value;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log.LogDebug(ex, "WebExtras: AniList failed for {Title} ({Year})", title, year);
+                }
+            }
+
+            cachedExtras.Data.AniListCachedAtUtc = now;
+            cachedExtras.Data.HasAniListScore = true;
+            cachedExtras.Data.AniListScore = anilistScore;
+
+            res.AniListScore = anilistScore;
+            extrasChanged = true;
+        }
+
+        if (extrasChanged)
+        {
+            await extrasCache.SaveAsync(extrasCacheKey, cachedExtras, cancellationToken).ConfigureAwait(false);
         }
 
         return Ok(res);
@@ -355,6 +395,100 @@ private static int? ReadInt(JsonElement obj, string prop)
     {
         return null;
     }
+}
+
+
+private static void ApplyCachedExtras(WebExtrasResponse res, WebExtrasCacheStore.WebExtrasCachedData? data)
+{
+    if (data is null)
+    {
+        return;
+    }
+
+    if (data.HasRtCriticsCertified)
+    {
+        res.RtCriticsCertified = data.RtCriticsCertified;
+    }
+
+    if (data.HasRtAudienceVerified)
+    {
+        res.RtAudienceVerified = data.RtAudienceVerified;
+    }
+
+    if (data.HasAniListScore)
+    {
+        res.AniListScore = data.AniListScore;
+    }
+}
+
+private static bool HasFreshRottenTomatoesExtras(
+    WebExtrasCacheStore.WebExtrasCachedData? data,
+    bool wantTc,
+    bool wantRv,
+    DateTimeOffset now,
+    TimeSpan ttl)
+{
+    if (!(wantTc || wantRv))
+    {
+        return true;
+    }
+
+    if (data?.RottenTomatoesCachedAtUtc is not { } cachedAt)
+    {
+        return false;
+    }
+
+    if ((now - cachedAt) > ttl)
+    {
+        return false;
+    }
+
+    return (!wantTc || data.HasRtCriticsCertified)
+        && (!wantRv || data.HasRtAudienceVerified);
+}
+
+private static bool HasFreshAniListExtra(
+    WebExtrasCacheStore.WebExtrasCachedData? data,
+    DateTimeOffset now,
+    TimeSpan ttl)
+{
+    if (data?.AniListCachedAtUtc is not { } cachedAt)
+    {
+        return false;
+    }
+
+    if ((now - cachedAt) > ttl)
+    {
+        return false;
+    }
+
+    return data.HasAniListScore;
+}
+
+private static TimeSpan GetWebExtrasTtl(PluginConfiguration cfg)
+{
+    if (cfg.CacheInterval != PluginConfiguration.CacheIntervalPreset.Unset)
+    {
+        return cfg.CacheInterval switch
+        {
+            PluginConfiguration.CacheIntervalPreset.Week => TimeSpan.FromDays(7),
+            PluginConfiguration.CacheIntervalPreset.Month => TimeSpan.FromDays(30),
+            _ => TimeSpan.FromDays(1)
+        };
+    }
+
+    var h = cfg.CacheHours <= 0 ? 24 : cfg.CacheHours;
+    if (h >= 24 * 30)
+    {
+        return TimeSpan.FromDays(30);
+    }
+
+    if (h >= 24 * 7)
+    {
+        return TimeSpan.FromDays(7);
+    }
+
+    return TimeSpan.FromDays(1);
 }
 
     private sealed class RtScorecard
