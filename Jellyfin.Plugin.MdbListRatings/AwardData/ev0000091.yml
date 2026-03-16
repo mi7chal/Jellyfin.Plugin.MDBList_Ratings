@@ -71,6 +71,10 @@
     caligari film award:
       nominee: [tt15311492]
       winner: []
+  amnesty international film prize:
+    amnesty international film prize:
+      nominee: [tt39371437]
+      winner: [tt39371437]
   special mention of the generation 14plus international jury:
     short film:
       nominee: [tt39211423]
@@ -79,6 +83,14 @@
     berlinale documentary award:
       nominee: [tt30744238, tt39206678, tt39210397, tt39215184, tt39215225, tt39368109, tt39368563, tt39368581, tt39370293, tt39382829, tt39382862, tt39382895, tt39383353, tt39383477, tt39383505, tt39383613]
       winner: []
+  gwff best first feature award:
+    gwff best first feature award:
+      nominee: [tt34734549]
+      winner: [tt34734549]
+  ag kino gilde - cinema vision 14plus:
+    ag kino gilde - cinema vision 14plus:
+      nominee: [tt39371437]
+      winner: [tt39371437]
 '2025': # https://www.imdb.com/event/ev0000091/2025/1/
   golden berlin bear:
     best film:
