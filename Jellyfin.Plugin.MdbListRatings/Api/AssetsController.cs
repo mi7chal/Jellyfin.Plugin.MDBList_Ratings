@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using Microsoft.AspNetCore.Mvc;
+using Jellyfin.Plugin.MdbListRatings.Awards;
 
 namespace Jellyfin.Plugin.MdbListRatings.Api;
 
@@ -67,26 +68,35 @@ public sealed class AssetsController : ControllerBase
             }
         }
 
-        var map = ResourceMap.Value;
-        if (!map.TryGetValue(fileName, out var resName))
-        {
-            return NotFound();
-        }
-
-        var asm = Assembly.GetExecutingAssembly();
-        var stream = asm.GetManifestResourceStream(resName);
-        if (stream is null)
-        {
-            return NotFound();
-        }
-
         var contentType = GetContentType(fileName) ?? "application/octet-stream";
 
-        // Cache aggressively; icons are versioned by plugin update.
-        Response.Headers["Cache-Control"] = "public,max-age=31536000,immutable";
-        Response.Headers["X-Content-Type-Options"] = "nosniff";
+        var map = ResourceMap.Value;
+        if (map.TryGetValue(fileName, out var resName))
+        {
+            var asm = Assembly.GetExecutingAssembly();
+            var stream = asm.GetManifestResourceStream(resName);
+            if (stream is not null)
+            {
+                // Cache aggressively; icons are versioned by plugin update.
+                Response.Headers["Cache-Control"] = "public,max-age=31536000,immutable";
+                Response.Headers["X-Content-Type-Options"] = "nosniff";
+                return File(stream, contentType);
+            }
+        }
 
-        return File(stream, contentType);
+        var plugin = Plugin.Instance;
+        if (plugin is not null)
+        {
+            var customFilePath = Path.Combine(plugin.Awards.CustomIconsDirectory, fileName);
+            if (System.IO.File.Exists(customFilePath))
+            {
+                Response.Headers["Cache-Control"] = "public,max-age=300";
+                Response.Headers["X-Content-Type-Options"] = "nosniff";
+                return PhysicalFile(customFilePath, contentType);
+            }
+        }
+
+        return NotFound();
     }
 
     private static string? GetContentType(string fileName)

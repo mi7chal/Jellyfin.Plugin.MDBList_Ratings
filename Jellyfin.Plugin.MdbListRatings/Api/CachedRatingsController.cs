@@ -62,6 +62,45 @@ public sealed class CachedRatingsController : ControllerBase
         });
     }
 
+
+
+    [HttpGet("CachedByItemId")]
+    [Produces("application/json")]
+    public async Task<ActionResult<CachedByTmdbResponse>> GetCachedByItemId(
+        [FromQuery] Guid itemId,
+        CancellationToken cancellationToken)
+    {
+        var plugin = Plugin.Instance;
+        if (plugin is null)
+        {
+            return Ok(new CachedByTmdbResponse { HasCache = false });
+        }
+
+        if (itemId == Guid.Empty)
+        {
+            return BadRequest("Missing required query parameter: itemId");
+        }
+
+        var item = plugin.LibraryManager.GetItemById(itemId);
+        if (item is null)
+        {
+            return Ok(new CachedByTmdbResponse { HasCache = false });
+        }
+
+        var env = await plugin.Updater.TryGetCacheEnvelopeByItemAsync(item, cancellationToken).ConfigureAwait(false);
+        if (env is null || env.Data is null)
+        {
+            return Ok(new CachedByTmdbResponse { HasCache = false });
+        }
+
+        return Ok(new CachedByTmdbResponse
+        {
+            HasCache = true,
+            CachedAtUtc = env.CachedAtUtc,
+            Ids = env.Data.Ids,
+            Ratings = env.Data.Ratings ?? new List<MdbListRating>()
+        });
+    }
     public sealed class CachedByTmdbResponse
     {
         [JsonPropertyName("hasCache")]
