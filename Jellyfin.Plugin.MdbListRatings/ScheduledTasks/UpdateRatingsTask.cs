@@ -19,7 +19,7 @@ public sealed class UpdateRatingsTask : IScheduledTask
 
     public string Key => "MdbListRatingsUpdate";
 
-    public string Description => "Fetch ratings from mdblist.com (by TMDb id) and write them into the standard Jellyfin rating fields.";
+    public string Description => "Fetch ratings from MDBList, TVmaze, OMDb, and season/episode ratings from Trakt/TMDb/TVmaze/OMDb, then write them into the standard Jellyfin rating fields.";
 
     public string Category => "Library";
 
@@ -32,17 +32,57 @@ public sealed class UpdateRatingsTask : IScheduledTask
         }
 
         var cfg = plugin.Configuration;
-        if (string.IsNullOrWhiteSpace(cfg.MdbListApiKey))
+
+        if (cfg.EnableImdbTop250Icon)
         {
-            plugin.Log.LogWarning("MDBList API key is empty. Configure it in Dashboard -> Plugins -> MDBList Ratings.");
-            return;
+            try
+            {
+                await plugin.Updater.EnsureImdbTop250ReadyAsync(cfg, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                plugin.Log.LogWarning(ex, "Failed to refresh IMDb Top 250 cache before the ratings task.");
+            }
         }
 
-        // Query all Movies and Series.
+        if (string.IsNullOrWhiteSpace(cfg.MdbListApiKey))
+        {
+            plugin.Log.LogWarning("MDBList API key is empty. MDBList-based sources will be skipped; TVmaze-only Series/Shows/Episodes mappings and Trakt/TMDb season-episode ratings can still be updated if configured.");
+        }
+
+        var needsTraktSeason = string.Equals((cfg.SeasonCommunitySource ?? string.Empty).Trim(), "trakt", StringComparison.OrdinalIgnoreCase)
+            || string.Equals((cfg.SeasonCommunityFallbackSource ?? string.Empty).Trim(), "trakt", StringComparison.OrdinalIgnoreCase);
+        var needsTraktEpisode = string.Equals((cfg.EpisodeCommunitySource ?? string.Empty).Trim(), "trakt", StringComparison.OrdinalIgnoreCase)
+            || string.Equals((cfg.EpisodeCommunityFallbackSource ?? string.Empty).Trim(), "trakt", StringComparison.OrdinalIgnoreCase);
+
+        if ((needsTraktSeason || needsTraktEpisode) && string.IsNullOrWhiteSpace(cfg.TraktClientId))
+        {
+            plugin.Log.LogWarning("Trakt Client ID is empty. Trakt-based season/episode ratings will be skipped.");
+        }
+
+        var needsTmdbSeason = string.Equals((cfg.SeasonCommunitySource ?? string.Empty).Trim(), "tmdb", StringComparison.OrdinalIgnoreCase)
+            || string.Equals((cfg.SeasonCommunityFallbackSource ?? string.Empty).Trim(), "tmdb", StringComparison.OrdinalIgnoreCase);
+        var needsTmdbEpisode = string.Equals((cfg.EpisodeCommunitySource ?? string.Empty).Trim(), "tmdb", StringComparison.OrdinalIgnoreCase)
+            || string.Equals((cfg.EpisodeCommunityFallbackSource ?? string.Empty).Trim(), "tmdb", StringComparison.OrdinalIgnoreCase);
+
+        if ((needsTmdbSeason || needsTmdbEpisode) && string.IsNullOrWhiteSpace(cfg.TmdbApiAuth))
+        {
+            plugin.Log.LogWarning("TMDb API key / Read Access Token is empty. TMDb-based season/episode ratings will be skipped.");
+        }
+
+        var needsOmdbEpisode = string.Equals((cfg.EpisodeCommunitySource ?? string.Empty).Trim(), "imdb", StringComparison.OrdinalIgnoreCase)
+            || string.Equals((cfg.EpisodeCommunityFallbackSource ?? string.Empty).Trim(), "imdb", StringComparison.OrdinalIgnoreCase);
+
+        if (needsOmdbEpisode && string.IsNullOrWhiteSpace(cfg.OmdbApiKey))
+        {
+            plugin.Log.LogWarning("OMDb API key is empty. IMDb-based episode ratings via OMDb will be skipped.");
+        }
+
+        // Query all Movies, Series, Seasons and Episodes.
         var items = plugin.LibraryManager.GetItemList(new InternalItemsQuery
         {
             Recursive = true,
-            IncludeItemTypes = new[] { BaseItemKind.Movie, BaseItemKind.Series }
+            IncludeItemTypes = new[] { BaseItemKind.Movie, BaseItemKind.Series, BaseItemKind.Season, BaseItemKind.Episode }
         });
 
         var total = items.Count;
