@@ -9,6 +9,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
+using System.Collections.Generic;
 using MediaBrowser.Model.Entities;
 using Microsoft.Extensions.Logging;
 
@@ -24,8 +25,18 @@ internal sealed class RatingsUpdater
     private readonly ILogger _logger;
     private readonly MdbListClient _client;
 
+    private readonly ImdbRatingsDataset _imdbFallback;
+    private readonly ImdbTop250Dataset _imdbTop250;
+    private readonly TvMazeClient _tvMaze;
+    private readonly TraktSeasonApiClient _traktSeason;
+    private readonly TraktEpisodeApiClient _traktEpisode;
+    private readonly TmdbSeasonApiClient _tmdbSeason;
+    private readonly TmdbEpisodeApiClient _tmdbEpisode;
+    private readonly OmdbEpisodeApiClient _omdbEpisode;
+
     private readonly MdbListCacheStore _cacheStore;
     private readonly RateLimitStateStore _rateLimit;
+    private readonly RateLimitStateStore _omdbRateLimit;
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private bool _initialized;
 
@@ -41,8 +52,17 @@ internal sealed class RatingsUpdater
     {
         _logger = logger;
         _client = new MdbListClient(httpClientFactory, logger);
+        _imdbFallback = new ImdbRatingsDataset(httpClientFactory, cacheDir, logger);
+        _imdbTop250 = new ImdbTop250Dataset(httpClientFactory, cacheDir, logger);
+        _tvMaze = new TvMazeClient(httpClientFactory, logger);
+        _traktSeason = new TraktSeasonApiClient(httpClientFactory, logger);
+        _traktEpisode = new TraktEpisodeApiClient(httpClientFactory, logger);
+        _tmdbSeason = new TmdbSeasonApiClient(httpClientFactory, logger);
+        _tmdbEpisode = new TmdbEpisodeApiClient(httpClientFactory, logger);
+        _omdbEpisode = new OmdbEpisodeApiClient(httpClientFactory, logger);
         _cacheStore = new MdbListCacheStore(cacheDir, logger);
         _rateLimit = new RateLimitStateStore(statePath, logger);
+        _omdbRateLimit = new RateLimitStateStore(System.IO.Path.Combine(System.IO.Path.GetDirectoryName(statePath) ?? string.Empty, "omdb-episode-state.json"), logger);
     }
 
     public async Task<UpdateOutcome> UpdateItemRatingsAsync(BaseItem item, CancellationToken cancellationToken)
@@ -57,13 +77,15 @@ internal sealed class RatingsUpdater
 
         var cfg = plugin.Configuration;
 
-        if (string.IsNullOrWhiteSpace(cfg.MdbListApiKey))
-        {
-            return UpdateOutcome.Skipped;
-        }
-
         string? contentType = null;
         bool isMovie = false;
+        bool isSeason = false;
+        bool isEpisode = false;
+        int? seasonNumber = null;
+        int? episodeNumber = null;
+        string? seasonShowTmdbId = null;
+        string? seasonShowImdbId = null;
+        string? seasonShowTvdbId = null;
 
         if (item is Movie)
         {
@@ -75,13 +97,111 @@ internal sealed class RatingsUpdater
             // MDBList expects "show" (not "tv").
             contentType = "show";
         }
+        else if (item is Season seasonItem)
+        {
+            contentType = "season";
+            isSeason = true;
+            var seasonLookup = ResolveSeasonLookup(item, seasonItem);
+            seasonNumber = seasonLookup.SeasonNumber;
+            seasonShowTmdbId = seasonLookup.ShowTmdbId;
+            seasonShowImdbId = seasonLookup.ShowImdbId;
+            seasonShowTvdbId = seasonLookup.ShowTvdbId;
+            if (!seasonNumber.HasValue || seasonNumber.Value < 0 || (string.IsNullOrWhiteSpace(seasonShowTmdbId) && string.IsNullOrWhiteSpace(seasonShowImdbId) && string.IsNullOrWhiteSpace(seasonShowTvdbId)))
+            {
+                return UpdateOutcome.Skipped;
+            }
+        }
+        else if (item is Episode episodeItem)
+        {
+            contentType = "episode";
+            isEpisode = true;
+            var episodeLookup = ResolveEpisodeLookup(item, episodeItem);
+            seasonNumber = episodeLookup.SeasonNumber;
+            episodeNumber = episodeLookup.EpisodeNumber;
+            seasonShowTmdbId = episodeLookup.ShowTmdbId;
+            seasonShowImdbId = episodeLookup.ShowImdbId;
+            seasonShowTvdbId = episodeLookup.ShowTvdbId;
+            if (!seasonNumber.HasValue || seasonNumber.Value < 0 || !episodeNumber.HasValue || episodeNumber.Value <= 0 || (string.IsNullOrWhiteSpace(seasonShowTmdbId) && string.IsNullOrWhiteSpace(seasonShowImdbId) && string.IsNullOrWhiteSpace(seasonShowTvdbId)))
+            {
+                _logger.LogDebug("Skipping episode rating update for {Name}: could not resolve SERIES ids for lookup (Episode TMDb={EpisodeTmdbId}, IMDb={EpisodeImdbId}, TVDB={EpisodeTvdbId}, Resolved show TMDb={ShowTmdbId}, IMDb={ShowImdbId}, TVDB={ShowTvdbId}, Season={SeasonNumber}, Episode={EpisodeNumber})",
+                    item.Name,
+                    item.GetProviderId(MetadataProvider.Tmdb),
+                    item.GetProviderId(MetadataProvider.Imdb),
+                    item.GetProviderId(MetadataProvider.Tvdb),
+                    seasonShowTmdbId,
+                    seasonShowImdbId,
+                    seasonShowTvdbId,
+                    seasonNumber,
+                    episodeNumber);
+                return UpdateOutcome.Skipped;
+            }
+        }
         else
         {
             return UpdateOutcome.Skipped;
         }
 
+        var effectiveForTransport = GetEffectiveMapping(item, cfg);
+
         var tmdbId = item.GetProviderId(MetadataProvider.Tmdb);
-        if (string.IsNullOrWhiteSpace(tmdbId))
+        var imdbId = item.GetProviderId(MetadataProvider.Imdb);
+        var tvdbId = item.GetProviderId(MetadataProvider.Tvdb);
+
+        var effectiveShowPrimary = NormalizeSource(effectiveForTransport.ShowCommunitySource);
+        var effectiveShowFallback = NormalizeSource(effectiveForTransport.ShowCommunityFallbackSource);
+        var effectiveSeasonPrimary = NormalizeSource(effectiveForTransport.SeasonCommunitySource);
+        var effectiveSeasonFallback = NormalizeSource(effectiveForTransport.SeasonCommunityFallbackSource);
+        var effectiveEpisodePrimary = NormalizeSource(effectiveForTransport.EpisodeCommunitySource);
+        var effectiveEpisodeFallback = NormalizeSource(effectiveForTransport.EpisodeCommunityFallbackSource);
+        // Always try to keep TVmaze cached for series/shows when an external id is available,
+        // so the Web "all ratings from cache" panel can display it even if TVmaze is not the
+        // selected primary/fallback source for metadata writing.
+        var needsTvMaze = !isMovie && !isSeason && !isEpisode && (!string.IsNullOrWhiteSpace(imdbId) || !string.IsNullOrWhiteSpace(tvdbId));
+        var needsSeasonTrakt = isSeason && seasonNumber.HasValue && SeasonRequiresTrakt(effectiveSeasonPrimary, effectiveSeasonFallback)
+            && (!string.IsNullOrWhiteSpace(seasonShowImdbId) || !string.IsNullOrWhiteSpace(seasonShowTvdbId));
+        var needsSeasonTmdb = isSeason && seasonNumber.HasValue && SeasonRequiresTmdb(effectiveSeasonPrimary, effectiveSeasonFallback)
+            && (!string.IsNullOrWhiteSpace(seasonShowTmdbId) || !string.IsNullOrWhiteSpace(seasonShowImdbId) || !string.IsNullOrWhiteSpace(seasonShowTvdbId));
+        var needsEpisodeTmdb = isEpisode && seasonNumber.HasValue && episodeNumber.HasValue && EpisodeRequiresTmdb(effectiveEpisodePrimary, effectiveEpisodeFallback)
+            && (!string.IsNullOrWhiteSpace(seasonShowTmdbId) || !string.IsNullOrWhiteSpace(seasonShowImdbId) || !string.IsNullOrWhiteSpace(seasonShowTvdbId));
+        var needsEpisodeTrakt = isEpisode && seasonNumber.HasValue && episodeNumber.HasValue && EpisodeRequiresTrakt(effectiveEpisodePrimary, effectiveEpisodeFallback)
+            && (!string.IsNullOrWhiteSpace(seasonShowImdbId) || !string.IsNullOrWhiteSpace(seasonShowTvdbId));
+        var needsEpisodeTvMaze = isEpisode && seasonNumber.HasValue && episodeNumber.HasValue && EpisodeRequiresTvMaze(effectiveEpisodePrimary, effectiveEpisodeFallback)
+            && (!string.IsNullOrWhiteSpace(seasonShowImdbId) || !string.IsNullOrWhiteSpace(seasonShowTvdbId));
+        var needsEpisodeOmdb = isEpisode && seasonNumber.HasValue && episodeNumber.HasValue && EpisodeRequiresOmdb(effectiveEpisodePrimary, effectiveEpisodeFallback)
+            && !string.IsNullOrWhiteSpace(imdbId);
+        var needsMdbList = !isSeason && !isEpisode && (isMovie || ShowRequiresMdbList(effectiveShowPrimary, effectiveShowFallback));
+
+        if (!needsMdbList && !needsTvMaze && !needsSeasonTrakt && !needsSeasonTmdb && !needsEpisodeTmdb && !needsEpisodeTrakt && !needsEpisodeTvMaze && !needsEpisodeOmdb)
+        {
+            return UpdateOutcome.Skipped;
+        }
+
+        if (needsMdbList && string.IsNullOrWhiteSpace(cfg.MdbListApiKey))
+        {
+            return UpdateOutcome.Skipped;
+        }
+
+        if ((needsSeasonTrakt || needsEpisodeTrakt) && string.IsNullOrWhiteSpace(cfg.TraktClientId))
+        {
+            return UpdateOutcome.Skipped;
+        }
+
+        if ((needsSeasonTmdb || needsEpisodeTmdb) && string.IsNullOrWhiteSpace(cfg.TmdbApiAuth))
+        {
+            return UpdateOutcome.Skipped;
+        }
+
+        if (needsEpisodeOmdb && string.IsNullOrWhiteSpace(cfg.OmdbApiKey))
+        {
+            return UpdateOutcome.Skipped;
+        }
+
+        if (needsMdbList && string.IsNullOrWhiteSpace(tmdbId))
+        {
+            return UpdateOutcome.Skipped;
+        }
+
+        if (needsTvMaze && string.IsNullOrWhiteSpace(imdbId) && string.IsNullOrWhiteSpace(tvdbId))
         {
             return UpdateOutcome.Skipped;
         }
@@ -105,26 +225,184 @@ internal sealed class RatingsUpdater
                     return UpdateOutcome.Skipped;
                 }
             }
+            else if (isSeason)
+            {
+                if (!allowUpdateCommunity && !needsSeasonTrakt && !needsSeasonTmdb)
+                {
+                    return UpdateOutcome.Skipped;
+                }
+            }
+            else if (isEpisode)
+            {
+                if (!allowUpdateCommunity && !needsEpisodeTmdb && !needsEpisodeTrakt && !needsEpisodeTvMaze && !needsEpisodeOmdb)
+                {
+                    return UpdateOutcome.Skipped;
+                }
+            }
             else
             {
-                // Series: only community
-                if (!allowUpdateCommunity)
+                // Series: still allow fetching/augmenting the cache (e.g. TVmaze) even when we
+                // are not going to overwrite the saved CommunityRating field.
+                if (!allowUpdateCommunity && !needsTvMaze)
                 {
                     return UpdateOutcome.Skipped;
                 }
             }
         }
 
-        var fetchResult = await GetCachedOrFetchAsync(contentType, tmdbId, cfg, cancellationToken).ConfigureAwait(false);
+        var fetchResult = isSeason
+            ? await GetCachedOrFetchSeasonAsync(item, seasonShowTmdbId, seasonShowImdbId, seasonShowTvdbId, seasonNumber!.Value, cfg, needsSeasonTrakt, needsSeasonTmdb, cancellationToken).ConfigureAwait(false)
+            : isEpisode
+                ? await GetCachedOrFetchEpisodeAsync(item, imdbId, seasonShowTmdbId, seasonShowImdbId, seasonShowTvdbId, seasonNumber!.Value, episodeNumber!.Value, cfg, effectiveEpisodePrimary, effectiveEpisodeFallback, needsEpisodeTmdb, needsEpisodeTrakt, needsEpisodeTvMaze, needsEpisodeOmdb, cancellationToken).ConfigureAwait(false)
+                : await GetCachedOrFetchAsync(contentType, tmdbId, imdbId, tvdbId, cfg, needsMdbList, needsTvMaze, cancellationToken).ConfigureAwait(false);
         if (fetchResult.Outcome == UpdateOutcome.RateLimited)
         {
             return UpdateOutcome.RateLimited;
+        }
+
+        // If MDBList returned 404 and we successfully used IMDb fallback, apply it directly.
+        if (fetchResult.ImdbFallbackCommunityRating.HasValue)
+        {
+            if (!allowUpdateCommunity)
+            {
+                // Respect UpdateOnlyWhenEmpty.
+                return UpdateOutcome.Skipped;
+            }
+
+            var imdbFallbackCommunity = fetchResult.ImdbFallbackCommunityRating.Value;
+            const string imdbFallbackSource = "imdb";
+
+            var imdbFallbackChanged = false;
+
+            var ratingChanged = !item.CommunityRating.HasValue || Math.Abs(item.CommunityRating.Value - imdbFallbackCommunity) > 0.01f;
+            if (ratingChanged)
+            {
+                item.CommunityRating = imdbFallbackCommunity;
+            }
+
+            var sourceChanged = SetProviderId(item, ProviderIdCommunitySource, imdbFallbackSource);
+            imdbFallbackChanged = ratingChanged || sourceChanged;
+
+            if (!imdbFallbackChanged)
+            {
+                return UpdateOutcome.Skipped;
+            }
+
+            try
+            {
+                await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
+                _logger.LogInformation("Updated ratings from IMDb fallback: {Name} (IMDb {ImdbId})", item.Name, imdbId);
+                return fetchResult.StopAfterThis ? UpdateOutcome.RateLimited : UpdateOutcome.Updated;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to save item after IMDb fallback rating update: {Name} (IMDb {ImdbId})", item.Name, imdbId);
+                return UpdateOutcome.Failed;
+            }
         }
 
         var data = fetchResult.Data;
         if (data is null || data.Ratings.Count == 0)
         {
             return fetchResult.Outcome == UpdateOutcome.Failed ? UpdateOutcome.Failed : UpdateOutcome.Skipped;
+        }
+
+        if (isSeason)
+        {
+            var seasonEffective = GetEffectiveMapping(item, cfg);
+            var seasonPrimary = NormalizeSource(seasonEffective.SeasonCommunitySource);
+            var seasonFallback = NormalizeSource(seasonEffective.SeasonCommunityFallbackSource);
+            var seasonResolved = ResolveScoreWithSource(data, seasonPrimary, seasonFallback);
+            if (!seasonResolved.Score0To100.HasValue)
+            {
+                return UpdateOutcome.Skipped;
+            }
+
+            var score = Clamp(seasonResolved.Score0To100.Value, 0, 100);
+            var seasonCommunity = (float)Math.Round(score / 10.0, 1, MidpointRounding.AwayFromZero);
+            if (seasonCommunity <= 0)
+            {
+                return UpdateOutcome.Skipped;
+            }
+
+            if (!allowUpdateCommunity)
+            {
+                return UpdateOutcome.Skipped;
+            }
+
+            var seasonRatingChanged = !item.CommunityRating.HasValue || Math.Abs(item.CommunityRating.Value - seasonCommunity) > 0.01f;
+            if (seasonRatingChanged)
+            {
+                item.CommunityRating = seasonCommunity;
+            }
+
+            var seasonSourceChanged = SetProviderId(item, ProviderIdCommunitySource, seasonResolved.UsedSource);
+            var seasonChanged = seasonRatingChanged || seasonSourceChanged;
+            if (!seasonChanged)
+            {
+                return UpdateOutcome.Skipped;
+            }
+
+            try
+            {
+                await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
+                _logger.LogInformation("Updated season ratings from configured source: {Name} (IMDb {ImdbId}, TVDB {TvdbId}, Season {SeasonNumber}, Source {Source})", item.Name, seasonShowImdbId, seasonShowTvdbId, seasonNumber, seasonResolved.UsedSource);
+                return UpdateOutcome.Updated;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to save season item after season rating update: {Name}", item.Name);
+                return UpdateOutcome.Failed;
+            }
+        }
+
+        if (isEpisode)
+        {
+            var episodeEffective = GetEffectiveMapping(item, cfg);
+            var episodePrimary = NormalizeSource(episodeEffective.EpisodeCommunitySource);
+            var episodeFallback = NormalizeSource(episodeEffective.EpisodeCommunityFallbackSource);
+            var episodeResolved = ResolveScoreWithSource(data, episodePrimary, episodeFallback);
+            if (!episodeResolved.Score0To100.HasValue)
+            {
+                return fetchResult.StopAfterThis ? UpdateOutcome.RateLimited : UpdateOutcome.Skipped;
+            }
+
+            var score = Clamp(episodeResolved.Score0To100.Value, 0, 100);
+            var episodeCommunity = (float)Math.Round(score / 10.0, 1, MidpointRounding.AwayFromZero);
+            if (episodeCommunity <= 0)
+            {
+                return fetchResult.StopAfterThis ? UpdateOutcome.RateLimited : UpdateOutcome.Skipped;
+            }
+
+            if (!allowUpdateCommunity)
+            {
+                return fetchResult.StopAfterThis ? UpdateOutcome.RateLimited : UpdateOutcome.Skipped;
+            }
+
+            var episodeRatingChanged = !item.CommunityRating.HasValue || Math.Abs(item.CommunityRating.Value - episodeCommunity) > 0.01f;
+            if (episodeRatingChanged)
+            {
+                item.CommunityRating = episodeCommunity;
+            }
+
+            var episodeSourceChanged = SetProviderId(item, ProviderIdCommunitySource, episodeResolved.UsedSource);
+            var episodeChanged = episodeRatingChanged || episodeSourceChanged;
+            if (!episodeChanged)
+            {
+                return fetchResult.StopAfterThis ? UpdateOutcome.RateLimited : UpdateOutcome.Skipped;
+            }
+
+            try
+            {
+                await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
+                _logger.LogInformation("Updated episode ratings from configured source: {Name} (IMDb {ImdbId}, TVDB {TvdbId}, S{SeasonNumber}E{EpisodeNumber}, Source {Source})", item.Name, seasonShowImdbId, seasonShowTvdbId, seasonNumber, episodeNumber, episodeResolved.UsedSource);
+                return fetchResult.StopAfterThis ? UpdateOutcome.RateLimited : UpdateOutcome.Updated;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to save episode item after episode rating update: {Name}", item.Name);
+                return fetchResult.StopAfterThis ? UpdateOutcome.RateLimited : UpdateOutcome.Failed;
+            }
         }
 
         // Resolve mapping, considering optional per-library overrides.
@@ -136,6 +414,8 @@ internal sealed class RatingsUpdater
         var movieCriticFallback = NormalizeSource(effective.MovieCriticFallbackSource);
         var showCommunitySource = NormalizeSource(effective.ShowCommunitySource);
         var showCommunityFallback = NormalizeSource(effective.ShowCommunityFallbackSource);
+        var seasonCommunitySource = NormalizeSource(effective.SeasonCommunitySource);
+        var seasonCommunityFallback = NormalizeSource(effective.SeasonCommunityFallbackSource);
 
         float? newCommunity = null;
         int? newCritic = null;
@@ -147,6 +427,10 @@ internal sealed class RatingsUpdater
         {
             (newCommunity, usedCommunitySource) = ExtractCommunityRatingWithSource(data, movieCommunitySource, movieCommunityFallback);
             (newCritic, usedCriticSource) = ExtractCriticRatingWithSource(data, movieCriticSource, movieCriticFallback);
+        }
+        else if (isSeason)
+        {
+            (newCommunity, usedCommunitySource) = ExtractCommunityRatingWithSource(data, seasonCommunitySource, seasonCommunityFallback);
         }
         else
         {
@@ -199,6 +483,93 @@ internal sealed class RatingsUpdater
         }
     }
 
+    private sealed class SeasonLookup
+    {
+        public string? ShowTmdbId { get; init; }
+        public string? ShowImdbId { get; init; }
+        public string? ShowTvdbId { get; init; }
+        public int? SeasonNumber { get; init; }
+    }
+
+    private SeasonLookup ResolveSeasonLookup(BaseItem item, Season season)
+    {
+        var seasonNo = season.IndexNumber ?? item.IndexNumber ?? item.ParentIndexNumber;
+
+        // Important: for season/episode TMDb lookup we need SERIES identifiers, not the season's own external ids.
+        // Some libraries store season-level provider ids on the Season item, which can poison TMDb series resolution.
+        // Therefore, prefer parent Series ids first and only fall back to the Season item ids when no series ids are available.
+        string? itemTmdb = item.GetProviderId(MetadataProvider.Tmdb);
+        string? itemImdb = item.GetProviderId(MetadataProvider.Imdb);
+        string? itemTvdb = item.GetProviderId(MetadataProvider.Tvdb);
+        string? showTmdbId = null;
+        string? showImdbId = null;
+        string? showTvdbId = null;
+
+        BaseItem? parent = item.DisplayParent;
+        if (parent is null && item.ParentId != Guid.Empty)
+        {
+            try { parent = Plugin.Instance?.LibraryManager.GetItemById(item.ParentId); } catch { parent = null; }
+        }
+
+        while (parent is not null)
+        {
+            if (parent is Series parentSeries)
+            {
+                showTmdbId ??= parentSeries.GetProviderId(MetadataProvider.Tmdb);
+                showImdbId ??= parentSeries.GetProviderId(MetadataProvider.Imdb);
+                showTvdbId ??= parentSeries.GetProviderId(MetadataProvider.Tvdb);
+            }
+
+            BaseItem? nextParent = parent.DisplayParent;
+            if (nextParent is null && parent.ParentId != Guid.Empty)
+            {
+                try { nextParent = Plugin.Instance?.LibraryManager.GetItemById(parent.ParentId); } catch { nextParent = null; }
+            }
+
+            parent = nextParent;
+        }
+
+        showTmdbId ??= itemTmdb;
+        showImdbId ??= itemImdb;
+        showTvdbId ??= itemTvdb;
+
+        return new SeasonLookup
+        {
+            ShowTmdbId = NormalizeDigits(showTmdbId),
+            ShowImdbId = NormalizeImdbId(showImdbId),
+            ShowTvdbId = NormalizeDigits(showTvdbId),
+            SeasonNumber = seasonNo
+        };
+    }
+
+    private static string BuildSeasonCacheKey(string? showTmdbId, string? showImdbId, string? showTvdbId, int seasonNumber)
+    {
+        if (seasonNumber < 0)
+        {
+            return string.Empty;
+        }
+
+        var imdb = NormalizeImdbId(showImdbId);
+        if (!string.IsNullOrWhiteSpace(imdb))
+        {
+            return $"season:imdb:{imdb}:season:{seasonNumber}";
+        }
+
+        var tmdb = NormalizeDigits(showTmdbId);
+        if (!string.IsNullOrWhiteSpace(tmdb))
+        {
+            return $"season:tmdb:{tmdb}:season:{seasonNumber}";
+        }
+
+        var tvdb = NormalizeDigits(showTvdbId);
+        if (!string.IsNullOrWhiteSpace(tvdb))
+        {
+            return $"season:tvdb:{tvdb}:season:{seasonNumber}";
+        }
+
+        return string.Empty;
+    }
+
     private static string NormalizeSource(string? s) => (s ?? string.Empty).Trim().ToLowerInvariant();
 
     private sealed class EffectiveMapping
@@ -209,6 +580,10 @@ internal sealed class RatingsUpdater
         public string MovieCriticFallbackSource { get; init; } = "none";
         public string ShowCommunitySource { get; init; } = "tmdb";
         public string ShowCommunityFallbackSource { get; init; } = "none";
+        public string SeasonCommunitySource { get; init; } = "trakt";
+        public string SeasonCommunityFallbackSource { get; init; } = "none";
+        public string EpisodeCommunitySource { get; init; } = "tmdb";
+        public string EpisodeCommunityFallbackSource { get; init; } = "none";
     }
 
     private EffectiveMapping GetEffectiveMapping(BaseItem item, PluginConfiguration cfg)
@@ -220,7 +595,11 @@ internal sealed class RatingsUpdater
             MovieCriticSource = cfg.MovieCriticSource,
             MovieCriticFallbackSource = cfg.MovieCriticFallbackSource,
             ShowCommunitySource = cfg.ShowCommunitySource,
-            ShowCommunityFallbackSource = cfg.ShowCommunityFallbackSource
+            ShowCommunityFallbackSource = cfg.ShowCommunityFallbackSource,
+            SeasonCommunitySource = cfg.SeasonCommunitySource,
+            SeasonCommunityFallbackSource = cfg.SeasonCommunityFallbackSource,
+            EpisodeCommunitySource = cfg.EpisodeCommunitySource,
+            EpisodeCommunityFallbackSource = cfg.EpisodeCommunityFallbackSource
         };
 
         var ov = FindOverrideForItem(item, cfg);
@@ -238,7 +617,11 @@ internal sealed class RatingsUpdater
             MovieCriticSource = string.IsNullOrWhiteSpace(ov.MovieCriticSource) ? mapping.MovieCriticSource : ov.MovieCriticSource,
             MovieCriticFallbackSource = string.IsNullOrWhiteSpace(ov.MovieCriticFallbackSource) ? mapping.MovieCriticFallbackSource : ov.MovieCriticFallbackSource,
             ShowCommunitySource = string.IsNullOrWhiteSpace(ov.ShowCommunitySource) ? mapping.ShowCommunitySource : ov.ShowCommunitySource,
-            ShowCommunityFallbackSource = string.IsNullOrWhiteSpace(ov.ShowCommunityFallbackSource) ? mapping.ShowCommunityFallbackSource : ov.ShowCommunityFallbackSource
+            ShowCommunityFallbackSource = string.IsNullOrWhiteSpace(ov.ShowCommunityFallbackSource) ? mapping.ShowCommunityFallbackSource : ov.ShowCommunityFallbackSource,
+            SeasonCommunitySource = string.IsNullOrWhiteSpace(ov.SeasonCommunitySource) ? mapping.SeasonCommunitySource : ov.SeasonCommunitySource,
+            SeasonCommunityFallbackSource = string.IsNullOrWhiteSpace(ov.SeasonCommunityFallbackSource) ? mapping.SeasonCommunityFallbackSource : ov.SeasonCommunityFallbackSource,
+            EpisodeCommunitySource = string.IsNullOrWhiteSpace(ov.EpisodeCommunitySource) ? mapping.EpisodeCommunitySource : ov.EpisodeCommunitySource,
+            EpisodeCommunityFallbackSource = string.IsNullOrWhiteSpace(ov.EpisodeCommunityFallbackSource) ? mapping.EpisodeCommunityFallbackSource : ov.EpisodeCommunityFallbackSource
         };
     }
 
@@ -468,6 +851,248 @@ internal sealed class RatingsUpdater
         return null;
     }
 
+    private static bool ShowRequiresMdbList(string primary, string fallback)
+    {
+        return RequiresMdbListSource(primary) || RequiresMdbListSource(fallback);
+    }
+
+    private static bool SeasonRequiresTrakt(string primary, string fallback)
+    {
+        return string.Equals(NormalizeSource(primary), "trakt", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(NormalizeSource(fallback), "trakt", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool SeasonRequiresTmdb(string primary, string fallback)
+    {
+        return string.Equals(NormalizeSource(primary), "tmdb", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(NormalizeSource(fallback), "tmdb", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool EpisodeRequiresTmdb(string primary, string fallback)
+    {
+        return string.Equals(NormalizeSource(primary), "tmdb", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(NormalizeSource(fallback), "tmdb", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool EpisodeRequiresTrakt(string primary, string fallback)
+    {
+        return string.Equals(NormalizeSource(primary), "trakt", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(NormalizeSource(fallback), "trakt", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool EpisodeRequiresTvMaze(string primary, string fallback)
+    {
+        return string.Equals(NormalizeSource(primary), "tvmaze", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(NormalizeSource(fallback), "tvmaze", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool EpisodeRequiresOmdb(string primary, string fallback)
+    {
+        return string.Equals(NormalizeSource(primary), "imdb", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(NormalizeSource(fallback), "imdb", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool RequiresMdbListSource(string? source)
+    {
+        var s = NormalizeSource(source);
+        return !string.IsNullOrWhiteSpace(s) && s != "none" && s != "tvmaze";
+    }
+
+    private static string? BuildCacheKey(string contentType, string? tmdbId, string? imdbId, string? tvdbId)
+    {
+        if (!string.IsNullOrWhiteSpace(tmdbId))
+        {
+            return $"{contentType}:{tmdbId.Trim()}";
+        }
+
+        var normalizedImdb = NormalizeImdbId(imdbId);
+        if (!string.IsNullOrWhiteSpace(normalizedImdb))
+        {
+            return $"{contentType}:imdb:{normalizedImdb}";
+        }
+
+        var normalizedTvdb = NormalizeDigits(tvdbId);
+        if (!string.IsNullOrWhiteSpace(normalizedTvdb))
+        {
+            return $"{contentType}:tvdb:{normalizedTvdb}";
+        }
+
+        return null;
+    }
+
+    private static bool HasRatingSource(MdbListTitleResponse? data, string source)
+    {
+        if (data?.Ratings is null || data.Ratings.Count == 0)
+        {
+            return false;
+        }
+
+        return data.Ratings.Any(r => string.Equals(r.Source, source, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void UpsertRating(MdbListTitleResponse data, MdbListRating rating)
+    {
+        var existing = data.Ratings.FirstOrDefault(r => string.Equals(r.Source, rating.Source, StringComparison.OrdinalIgnoreCase));
+        if (existing is null)
+        {
+            data.Ratings.Add(rating);
+            return;
+        }
+
+        existing.Value = rating.Value;
+        existing.Score = rating.Score;
+        existing.Votes = rating.Votes;
+        existing.Url = rating.Url;
+    }
+
+    private static void EnsureIds(MdbListTitleResponse data, string? tmdbId, string? imdbId)
+    {
+        data.Ids ??= new MdbListIds();
+
+        if (string.IsNullOrWhiteSpace(data.Ids.Imdb))
+        {
+            data.Ids.Imdb = NormalizeImdbId(imdbId);
+        }
+
+        if (!data.Ids.Tmdb.HasValue && int.TryParse(tmdbId, out var tmdb))
+        {
+            data.Ids.Tmdb = tmdb;
+        }
+    }
+
+    private async Task<MdbListRating?> TryFetchTvMazeRatingAsync(string? imdbId, string? tvdbId, CancellationToken cancellationToken)
+    {
+        var lookup = await _tvMaze.LookupShowAsync(imdbId, tvdbId, cancellationToken).ConfigureAwait(false);
+        if (lookup is null || lookup.AverageRating <= 0)
+        {
+            return null;
+        }
+
+        var avg = lookup.AverageRating;
+        return new MdbListRating
+        {
+            Source = "tvmaze",
+            Value = Math.Round(avg, 1, MidpointRounding.AwayFromZero),
+            Score = Math.Round(avg * 10.0, 1, MidpointRounding.AwayFromZero),
+            Url = lookup.Url
+        };
+    }
+
+    private async Task<MdbListRating?> TryFetchTvMazeEpisodeRatingAsync(string? imdbId, string? tvdbId, int seasonNumber, int episodeNumber, TimeSpan ttl, CancellationToken cancellationToken)
+    {
+        var lookup = await _tvMaze.LookupEpisodeAsync(imdbId, tvdbId, seasonNumber, episodeNumber, ttl, cancellationToken).ConfigureAwait(false);
+        if (lookup is null || lookup.AverageRating <= 0)
+        {
+            return null;
+        }
+
+        var avg = lookup.AverageRating;
+        return new MdbListRating
+        {
+            Source = "tvmaze",
+            Value = Math.Round(avg, 1, MidpointRounding.AwayFromZero),
+            Score = Math.Round(avg * 10.0, 1, MidpointRounding.AwayFromZero),
+            Url = lookup.Url
+        };
+    }
+
+    private async Task<MdbListRating?> TryFetchTraktEpisodeRatingAsync(string? imdbId, string? tvdbId, int seasonNumber, int episodeNumber, TimeSpan ttl, string? clientId, CancellationToken cancellationToken)
+    {
+        var lookup = await _traktEpisode.LookupEpisodeAsync(imdbId, tvdbId, seasonNumber, episodeNumber, ttl, clientId, cancellationToken).ConfigureAwait(false);
+        if (lookup is null || lookup.AverageRating <= 0)
+        {
+            return null;
+        }
+
+        var avg = lookup.AverageRating;
+        return new MdbListRating
+        {
+            Source = "trakt",
+            Value = Math.Round(avg, 1, MidpointRounding.AwayFromZero),
+            Score = Math.Round(avg * 10.0, 1, MidpointRounding.AwayFromZero),
+            Votes = lookup.Votes,
+            Url = lookup.Url
+        };
+    }
+
+    private async Task<OmdbEpisodeApiClient.OmdbEpisodeLookupResponse> TryFetchOmdbEpisodeRatingAsync(string? episodeImdbId, TimeSpan ttl, string? apiKey, CancellationToken cancellationToken)
+    {
+        return await _omdbEpisode.LookupEpisodeByImdbAsync(episodeImdbId, ttl, apiKey, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static string? NormalizeImdbId(string? imdbId)
+    {
+        if (string.IsNullOrWhiteSpace(imdbId))
+        {
+            return null;
+        }
+
+        var trimmed = imdbId.Trim();
+        if (trimmed.StartsWith("tt", StringComparison.OrdinalIgnoreCase))
+        {
+            var digits = NormalizeDigits(trimmed[2..]);
+            return string.IsNullOrWhiteSpace(digits) ? null : "tt" + digits;
+        }
+
+        var onlyDigits = NormalizeDigits(trimmed);
+        return string.IsNullOrWhiteSpace(onlyDigits) ? null : "tt" + onlyDigits;
+    }
+
+    private static string? NormalizeDigits(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var sb = new System.Text.StringBuilder(value.Length);
+        foreach (var ch in value)
+        {
+            if (char.IsDigit(ch))
+            {
+                sb.Append(ch);
+            }
+        }
+
+        return sb.Length == 0 ? null : sb.ToString();
+    }
+
+    private static float? TryExtractImdbFallbackCommunityRating(MdbListCacheStore.CacheEnvelope env)
+    {
+        try
+        {
+            if (env is null || env.Data is null || env.Data.Ratings is null || env.Data.Ratings.Count == 0)
+            {
+                return null;
+            }
+
+            // We only treat this as a hard IMDb fallback when we explicitly marked it.
+            if (string.IsNullOrWhiteSpace(env.RawJson) || env.RawJson.IndexOf("imdb-fallback", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return null;
+            }
+
+            var rating = env.Data.Ratings.FirstOrDefault(r => string.Equals(r.Source, "imdb", StringComparison.OrdinalIgnoreCase));
+            if (rating?.Value is null)
+            {
+                return null;
+            }
+
+            var v = rating.Value.Value;
+            if (double.IsNaN(v) || double.IsInfinity(v) || v <= 0)
+            {
+                return null;
+            }
+
+            // IMDb averageRating is 0-10.
+            return (float)v;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private async Task EnsureInitializedAsync(CancellationToken cancellationToken)
     {
         if (_initialized)
@@ -484,6 +1109,7 @@ internal sealed class RatingsUpdater
             }
 
             await _rateLimit.LoadAsync(cancellationToken).ConfigureAwait(false);
+            await _omdbRateLimit.LoadAsync(cancellationToken).ConfigureAwait(false);
             _initialized = true;
         }
         finally
@@ -517,78 +1143,409 @@ internal sealed class RatingsUpdater
         public MdbListTitleResponse? Data { get; init; }
         public UpdateOutcome Outcome { get; init; } = UpdateOutcome.Skipped;
         public bool StopAfterThis { get; init; }
+
+        public float? ImdbFallbackCommunityRating { get; init; }
     }
 
-    private async Task<FetchResult> GetCachedOrFetchAsync(
-        string contentType,
-        string tmdbId,
+    internal async Task EnsureImdbTop250ReadyAsync(PluginConfiguration cfg, CancellationToken cancellationToken)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        if (!cfg.EnableImdbTop250Icon)
+        {
+            return;
+        }
+
+        await _imdbTop250.EnsureReadyAsync(GetTtl(cfg), cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task<ImdbTop250Snapshot?> TryGetImdbTop250SnapshotAsync(CancellationToken cancellationToken)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+        return await _imdbTop250.TryGetSnapshotAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task<MdbListCacheStore.CacheEnvelope?> TryGetCacheEnvelopeByItemAsync(BaseItem item, CancellationToken cancellationToken)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        string? key = null;
+        if (item is Movie)
+        {
+            key = BuildCacheKey("movie", item.GetProviderId(MetadataProvider.Tmdb), item.GetProviderId(MetadataProvider.Imdb), item.GetProviderId(MetadataProvider.Tvdb));
+        }
+        else if (item is Series)
+        {
+            key = BuildCacheKey("show", item.GetProviderId(MetadataProvider.Tmdb), item.GetProviderId(MetadataProvider.Imdb), item.GetProviderId(MetadataProvider.Tvdb));
+        }
+        else if (item is Season seasonItem)
+        {
+            var seasonLookup = ResolveSeasonLookup(item, seasonItem);
+            if (seasonLookup.SeasonNumber.HasValue)
+            {
+                key = BuildSeasonCacheKey(seasonLookup.ShowTmdbId, seasonLookup.ShowImdbId, seasonLookup.ShowTvdbId, seasonLookup.SeasonNumber.Value);
+            }
+        }
+        else if (item is Episode episodeItem)
+        {
+            var episodeLookup = ResolveEpisodeLookup(item, episodeItem);
+            if (episodeLookup.SeasonNumber.HasValue && episodeLookup.EpisodeNumber.HasValue)
+            {
+                key = BuildEpisodeCacheKey(episodeLookup.ShowTmdbId, episodeLookup.ShowImdbId, episodeLookup.ShowTvdbId, episodeLookup.SeasonNumber.Value, episodeLookup.EpisodeNumber.Value);
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return null;
+        }
+
+        return await _cacheStore.TryGetAsync(key, cancellationToken).ConfigureAwait(false);
+    }
+
+    private sealed class EpisodeLookup
+    {
+        public string? ShowTmdbId { get; init; }
+        public string? ShowImdbId { get; init; }
+        public string? ShowTvdbId { get; init; }
+        public int? SeasonNumber { get; init; }
+        public int? EpisodeNumber { get; init; }
+    }
+
+    private static string BuildEpisodeCacheKey(string? showTmdbId, string? showImdbId, string? showTvdbId, int seasonNumber, int episodeNumber)
+    {
+        if (seasonNumber < 0 || episodeNumber <= 0)
+        {
+            return string.Empty;
+        }
+
+        var tmdb = NormalizeDigits(showTmdbId);
+        if (!string.IsNullOrWhiteSpace(tmdb))
+        {
+            return $"episode:tmdb:{tmdb}:season:{seasonNumber}:episode:{episodeNumber}";
+        }
+
+        var imdb = NormalizeImdbId(showImdbId);
+        if (!string.IsNullOrWhiteSpace(imdb))
+        {
+            return $"episode:imdb:{imdb}:season:{seasonNumber}:episode:{episodeNumber}";
+        }
+
+        var tvdb = NormalizeDigits(showTvdbId);
+        if (!string.IsNullOrWhiteSpace(tvdb))
+        {
+            return $"episode:tvdb:{tvdb}:season:{seasonNumber}:episode:{episodeNumber}";
+        }
+
+        return string.Empty;
+    }
+
+    private EpisodeLookup ResolveEpisodeLookup(BaseItem item, Episode episodeItem)
+    {
+        // Important: for TMDb episode lookup we need SERIES identifiers, not the episode's own external ids.
+        // Some libraries store episode-level TVDB/IMDb ids on Episode items. If we prefer those ids, TMDb /find can fail
+        // or resolve incorrectly. Therefore, resolve parent Series ids first and only fall back to item ids if needed.
+        string? itemTmdb = item.GetProviderId(MetadataProvider.Tmdb);
+        string? itemImdb = item.GetProviderId(MetadataProvider.Imdb);
+        string? itemTvdb = item.GetProviderId(MetadataProvider.Tvdb);
+        string? showTmdbId = null;
+        string? showImdbId = null;
+        string? showTvdbId = null;
+        int? resolvedSeason = episodeItem.ParentIndexNumber;
+        int? resolvedEpisode = episodeItem.IndexNumber;
+
+        BaseItem? parent = item.DisplayParent;
+        if (parent is null && item.ParentId != Guid.Empty)
+        {
+            try { parent = Plugin.Instance?.LibraryManager.GetItemById(item.ParentId); } catch { parent = null; }
+        }
+
+        while (parent is not null)
+        {
+            if (parent is Season parentSeason)
+            {
+                resolvedSeason ??= parentSeason.IndexNumber;
+                showTmdbId ??= parentSeason.Series?.GetProviderId(MetadataProvider.Tmdb);
+                showImdbId ??= parentSeason.Series?.GetProviderId(MetadataProvider.Imdb);
+                showTvdbId ??= parentSeason.Series?.GetProviderId(MetadataProvider.Tvdb);
+            }
+            else if (parent is Series parentSeries)
+            {
+                showTmdbId ??= parentSeries.GetProviderId(MetadataProvider.Tmdb);
+                showImdbId ??= parentSeries.GetProviderId(MetadataProvider.Imdb);
+                showTvdbId ??= parentSeries.GetProviderId(MetadataProvider.Tvdb);
+            }
+
+            BaseItem? nextParent = parent.DisplayParent;
+            if (nextParent is null && parent.ParentId != Guid.Empty)
+            {
+                try { nextParent = Plugin.Instance?.LibraryManager.GetItemById(parent.ParentId); } catch { nextParent = null; }
+            }
+
+            parent = nextParent;
+        }
+
+        showTmdbId ??= itemTmdb;
+        showImdbId ??= itemImdb;
+        showTvdbId ??= itemTvdb;
+
+        return new EpisodeLookup
+        {
+            ShowTmdbId = NormalizeDigits(showTmdbId),
+            ShowImdbId = NormalizeImdbId(showImdbId),
+            ShowTvdbId = NormalizeDigits(showTvdbId),
+            SeasonNumber = resolvedSeason,
+            EpisodeNumber = resolvedEpisode
+        };
+    }
+
+    private async Task<FetchResult> GetCachedOrFetchEpisodeAsync(
+        BaseItem item,
+        string? episodeImdbId,
+        string? showTmdbId,
+        string? showImdbId,
+        string? showTvdbId,
+        int seasonNumber,
+        int episodeNumber,
         PluginConfiguration cfg,
+        string episodePrimarySource,
+        string episodeFallbackSource,
+        bool needsEpisodeTmdb,
+        bool needsEpisodeTrakt,
+        bool needsEpisodeTvMaze,
+        bool needsEpisodeOmdb,
         CancellationToken cancellationToken)
     {
-        var cacheKey = $"{contentType}:{tmdbId}";
+        var cacheKey = BuildEpisodeCacheKey(showTmdbId, showImdbId, showTvdbId, seasonNumber, episodeNumber);
+        if (string.IsNullOrWhiteSpace(cacheKey))
+        {
+            return new FetchResult { Data = null, Outcome = UpdateOutcome.Skipped };
+        }
+
         var now = DateTimeOffset.UtcNow;
         var ttl = GetTtl(cfg);
+        var normalizedEpisodePrimary = NormalizeSource(episodePrimarySource);
+        var omdbPrimary = string.Equals(normalizedEpisodePrimary, "imdb", StringComparison.OrdinalIgnoreCase);
+        var omdbCooldownActive = _omdbRateLimit.NotBeforeUtc.HasValue && _omdbRateLimit.NotBeforeUtc.Value > now;
+
+        async Task<FetchResult> ReturnEpisodeCacheAsync(MdbListCacheStore.CacheEnvelope env)
+        {
+            var changed = false;
+            EnsureIds(env.Data, showTmdbId, showImdbId);
+
+            if (needsEpisodeOmdb && !HasRatingSource(env.Data, "imdb"))
+            {
+                if (omdbCooldownActive)
+                {
+                    if (omdbPrimary)
+                    {
+                        _logger.LogWarning("OMDb daily request limit cooldown is active until {NotBeforeUtc:o}. Episode processing will continue on the next run.", _omdbRateLimit.NotBeforeUtc!.Value);
+                        return new FetchResult { Data = null, Outcome = UpdateOutcome.RateLimited };
+                    }
+                }
+                else
+                {
+                    var omdbLookup = await TryFetchOmdbEpisodeRatingAsync(episodeImdbId, ttl, cfg.OmdbApiKey, cancellationToken).ConfigureAwait(false);
+                    if (omdbLookup.IsRateLimited)
+                    {
+                        await _omdbRateLimit.UpdateAsync(null, 0, null, true, cancellationToken).ConfigureAwait(false);
+                        if (omdbPrimary)
+                        {
+                            _logger.LogWarning("OMDb daily request limit reached while updating episode ratings. Episode processing will stop until the quota resets.");
+                            return HasRatingSource(env.Data, "imdb")
+                                ? new FetchResult { Data = env.Data, Outcome = UpdateOutcome.Skipped, StopAfterThis = true }
+                                : new FetchResult { Data = null, Outcome = UpdateOutcome.RateLimited };
+                        }
+                    }
+                    else
+                    {
+                        await _omdbRateLimit.UpdateAsync(null, 1, null, false, cancellationToken).ConfigureAwait(false);
+                        if (omdbLookup.Data is not null)
+                        {
+                            UpsertRating(env.Data, new MdbListRating
+                            {
+                                Source = "imdb",
+                                Value = omdbLookup.Data.AverageRating,
+                                Score = Math.Round(omdbLookup.Data.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
+                                Votes = omdbLookup.Data.Votes,
+                                Url = omdbLookup.Data.Url
+                            });
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            if (needsEpisodeTmdb && !HasRatingSource(env.Data, "tmdb"))
+            {
+                try
+                {
+                    var tmdb = await _tmdbEpisode.LookupEpisodeAsync(showTmdbId, showImdbId, showTvdbId, seasonNumber, episodeNumber, cfg.TmdbApiAuth, cancellationToken).ConfigureAwait(false);
+                    if (tmdb is not null && tmdb.AverageRating > 0)
+                    {
+                        UpsertRating(env.Data, new MdbListRating
+                        {
+                            Source = "tmdb",
+                            Value = Math.Round(tmdb.AverageRating, 1, MidpointRounding.AwayFromZero),
+                            Score = Math.Round(tmdb.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
+                            Votes = tmdb.Votes,
+                            Url = tmdb.Url
+                        });
+                        if (env.Data.Ids is null || !env.Data.Ids.Tmdb.HasValue)
+                        {
+                            EnsureIds(env.Data, tmdb.SeriesTmdbId.ToString(), showImdbId);
+                        }
+                        changed = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "TMDb episode augmentation failed for {Key}", cacheKey);
+                }
+            }
+
+            if (needsEpisodeTrakt && !HasRatingSource(env.Data, "trakt"))
+            {
+                try
+                {
+                    var trakt = await TryFetchTraktEpisodeRatingAsync(showImdbId, showTvdbId, seasonNumber, episodeNumber, ttl, cfg.TraktClientId, cancellationToken).ConfigureAwait(false);
+                    if (trakt is not null)
+                    {
+                        UpsertRating(env.Data, trakt);
+                        changed = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Trakt episode augmentation failed for {Key}", cacheKey);
+                }
+            }
+
+            if (needsEpisodeTvMaze && !HasRatingSource(env.Data, "tvmaze"))
+            {
+                try
+                {
+                    var tvmaze = await TryFetchTvMazeEpisodeRatingAsync(showImdbId, showTvdbId, seasonNumber, episodeNumber, ttl, cancellationToken).ConfigureAwait(false);
+                    if (tvmaze is not null)
+                    {
+                        UpsertRating(env.Data, tvmaze);
+                        changed = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "TVMaze episode augmentation failed for {Key}", cacheKey);
+                }
+            }
+
+            if (changed)
+            {
+                env.CachedAtUtc = now;
+                await _cacheStore.SaveAsync(cacheKey, env, cancellationToken).ConfigureAwait(false);
+            }
+
+            return new FetchResult { Data = env.Data, Outcome = UpdateOutcome.Skipped };
+        }
 
         var cached = await _cacheStore.TryGetAsync(cacheKey, cancellationToken).ConfigureAwait(false);
-        if (cached is not null)
+        if (cached is not null && (now - cached.CachedAtUtc) <= ttl)
         {
-            var age = now - cached.CachedAtUtc;
-            if (age <= ttl)
-            {
-                return new FetchResult { Data = cached.Data, Outcome = UpdateOutcome.Skipped };
-            }
+            return await ReturnEpisodeCacheAsync(cached).ConfigureAwait(false);
         }
 
-		// If a stored cooldown is active, prefer stale cache when available.
-		// If there is no cache, do one live request to revalidate the cooldown.
-		// This avoids getting stuck on a stale persisted cooldown state.
-		if (_rateLimit.NotBeforeUtc.HasValue && _rateLimit.NotBeforeUtc.Value > now)
-		{
-			if (cached is not null)
-			{
-				return new FetchResult { Data = cached.Data, Outcome = UpdateOutcome.Skipped };
-			}
-
-			_logger.LogWarning(
-				"MDBList rate limit cooldown is active until {NotBeforeUtc:o}, but no cache is available for {Key}. Revalidating with a live request.",
-				_rateLimit.NotBeforeUtc.Value,
-				cacheKey);
-		}
-
-        // Delay only when we are about to make a network request.
-        if (cfg.RequestDelayMs > 0)
+        if (omdbPrimary && omdbCooldownActive)
         {
-            await Task.Delay(cfg.RequestDelayMs, cancellationToken).ConfigureAwait(false);
-        }
-
-        var api = await _client.GetByTmdbAsync(contentType, tmdbId, cfg.MdbListApiKey, cancellationToken).ConfigureAwait(false);
-
-        var quotaExhausted = api.RateLimitRemaining.HasValue && api.RateLimitRemaining.Value <= 0;
-
-        // Update rate-limit state based on headers.
-        // - api.IsRateLimited: hard limit (e.g., HTTP 429)
-        // - quotaExhausted: this request succeeded, but remaining is 0, so we should stop until reset.
-        await _rateLimit.UpdateAsync(api.RateLimitLimit, api.RateLimitRemaining, api.RateLimitResetUtc, api.IsRateLimited || quotaExhausted, cancellationToken)
-            .ConfigureAwait(false);
-
-        if (api.IsRateLimited)
-        {
-            // If we have stale cache, we can still proceed with it; otherwise stop.
-            if (cached is not null)
+            if (cached is not null && HasRatingSource(cached.Data, "imdb"))
             {
-                _logger.LogWarning("MDBList rate limit reached. Using stale cache for {Key}.", cacheKey);
-                return new FetchResult { Data = cached.Data, Outcome = UpdateOutcome.Skipped };
+                return new FetchResult { Data = cached.Data, Outcome = UpdateOutcome.Skipped, StopAfterThis = true };
             }
 
-            _logger.LogWarning(
-                "MDBList rate limit reached. Will continue after {ResetUtc:o}.",
-                api.RateLimitResetUtc ?? (_rateLimit.NotBeforeUtc ?? now.AddHours(24)));
+            _logger.LogWarning("OMDb daily request limit cooldown is active until {NotBeforeUtc:o}. Episode processing will continue on the next run.", _omdbRateLimit.NotBeforeUtc!.Value);
             return new FetchResult { Data = null, Outcome = UpdateOutcome.RateLimited };
         }
 
-        if (api.Data is null)
+        var data = cached?.Data ?? new MdbListTitleResponse
         {
-            // Network error or parse error. If we have old cache, use it; otherwise fail.
+            Type = "episode",
+            Ids = new MdbListIds
+            {
+                Imdb = NormalizeImdbId(showImdbId),
+                Tmdb = int.TryParse(NormalizeDigits(showTmdbId), out var parsedTmdb) ? parsedTmdb : null
+            }
+        };
+        EnsureIds(data, showTmdbId, showImdbId);
+
+        if (needsEpisodeOmdb && !HasRatingSource(data, "imdb") && !omdbCooldownActive)
+        {
+            var omdbLookup = await TryFetchOmdbEpisodeRatingAsync(episodeImdbId, ttl, cfg.OmdbApiKey, cancellationToken).ConfigureAwait(false);
+            if (omdbLookup.IsRateLimited)
+            {
+                await _omdbRateLimit.UpdateAsync(null, 0, null, true, cancellationToken).ConfigureAwait(false);
+                if (omdbPrimary)
+                {
+                    _logger.LogWarning("OMDb daily request limit reached while updating episode ratings. Episode processing will stop until the quota resets.");
+                    if (cached is not null && HasRatingSource(cached.Data, "imdb"))
+                    {
+                        return new FetchResult { Data = cached.Data, Outcome = UpdateOutcome.Skipped, StopAfterThis = true };
+                    }
+
+                    return new FetchResult { Data = null, Outcome = UpdateOutcome.RateLimited };
+                }
+            }
+            else
+            {
+                await _omdbRateLimit.UpdateAsync(null, 1, null, false, cancellationToken).ConfigureAwait(false);
+                if (omdbLookup.Data is not null)
+                {
+                    UpsertRating(data, new MdbListRating
+                    {
+                        Source = "imdb",
+                        Value = omdbLookup.Data.AverageRating,
+                        Score = Math.Round(omdbLookup.Data.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
+                        Votes = omdbLookup.Data.Votes,
+                        Url = omdbLookup.Data.Url
+                    });
+                }
+            }
+        }
+
+        if (needsEpisodeTmdb && !HasRatingSource(data, "tmdb"))
+        {
+            var lookup = await _tmdbEpisode.LookupEpisodeAsync(showTmdbId, showImdbId, showTvdbId, seasonNumber, episodeNumber, cfg.TmdbApiAuth, cancellationToken).ConfigureAwait(false);
+            if (lookup is not null && lookup.AverageRating > 0)
+            {
+                UpsertRating(data, new MdbListRating
+                {
+                    Source = "tmdb",
+                    Value = Math.Round(lookup.AverageRating, 1, MidpointRounding.AwayFromZero),
+                    Score = Math.Round(lookup.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
+                    Votes = lookup.Votes,
+                    Url = lookup.Url
+                });
+                EnsureIds(data, lookup.SeriesTmdbId.ToString(), showImdbId);
+            }
+        }
+
+        if (needsEpisodeTrakt && !HasRatingSource(data, "trakt"))
+        {
+            var lookup = await TryFetchTraktEpisodeRatingAsync(showImdbId, showTvdbId, seasonNumber, episodeNumber, ttl, cfg.TraktClientId, cancellationToken).ConfigureAwait(false);
+            if (lookup is not null)
+            {
+                UpsertRating(data, lookup);
+            }
+        }
+
+        if (needsEpisodeTvMaze && !HasRatingSource(data, "tvmaze"))
+        {
+            var lookup = await TryFetchTvMazeEpisodeRatingAsync(showImdbId, showTvdbId, seasonNumber, episodeNumber, ttl, cancellationToken).ConfigureAwait(false);
+            if (lookup is not null)
+            {
+                UpsertRating(data, lookup);
+            }
+        }
+
+        if (data.Ratings.Count == 0)
+        {
             if (cached is not null)
             {
                 return new FetchResult { Data = cached.Data, Outcome = UpdateOutcome.Skipped };
@@ -597,18 +1554,407 @@ internal sealed class RatingsUpdater
             return new FetchResult { Data = null, Outcome = UpdateOutcome.Failed };
         }
 
-        // Save to cache.
+        var episodeSourceCount = (needsEpisodeTmdb ? 1 : 0) + (needsEpisodeTrakt ? 1 : 0) + (needsEpisodeTvMaze ? 1 : 0) + (needsEpisodeOmdb ? 1 : 0);
+        var episodeSourceTag = episodeSourceCount > 1
+            ? "episode-multi"
+            : needsEpisodeOmdb
+                ? "omdb-episode"
+                : needsEpisodeTrakt
+                    ? "trakt-episode"
+                    : needsEpisodeTvMaze
+                        ? "tvmaze-episode"
+                        : "tmdb-episode";
+
         var env = new MdbListCacheStore.CacheEnvelope
         {
             CachedAtUtc = now,
-            Data = api.Data,
-            RawJson = api.RawJson
+            Data = data,
+            RawJson = $"{{\"source\":\"{episodeSourceTag}\"}}"
         };
 
         await _cacheStore.SaveAsync(cacheKey, env, cancellationToken).ConfigureAwait(false);
+        return new FetchResult { Data = data, Outcome = UpdateOutcome.Skipped };
+    }
 
-        // If quota is exhausted, we still return data for this item, but signal the task to stop afterwards.
-        return new FetchResult { Data = api.Data, Outcome = UpdateOutcome.Skipped, StopAfterThis = quotaExhausted };
+    private async Task<FetchResult> GetCachedOrFetchSeasonAsync(
+        BaseItem item,
+        string? showTmdbId,
+        string? showImdbId,
+        string? showTvdbId,
+        int seasonNumber,
+        PluginConfiguration cfg,
+        bool needsSeasonTrakt,
+        bool needsSeasonTmdb,
+        CancellationToken cancellationToken)
+    {
+        var cacheKey = BuildSeasonCacheKey(showTmdbId, showImdbId, showTvdbId, seasonNumber);
+        if (string.IsNullOrWhiteSpace(cacheKey))
+        {
+            return new FetchResult { Data = null, Outcome = UpdateOutcome.Skipped };
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var ttl = GetTtl(cfg);
+
+        async Task<FetchResult> ReturnSeasonCacheAsync(MdbListCacheStore.CacheEnvelope env)
+        {
+            var changed = false;
+            EnsureIds(env.Data, showTmdbId, showImdbId);
+
+            if (needsSeasonTrakt && !HasRatingSource(env.Data, "trakt"))
+            {
+                try
+                {
+                    var trakt = await _traktSeason.LookupSeasonAsync(showImdbId, showTvdbId, seasonNumber, cfg.TraktClientId, cancellationToken).ConfigureAwait(false);
+                    if (trakt is not null && trakt.AverageRating > 0)
+                    {
+                        UpsertRating(env.Data, new MdbListRating
+                        {
+                            Source = "trakt",
+                            Value = Math.Round(trakt.AverageRating, 1, MidpointRounding.AwayFromZero),
+                            Score = Math.Round(trakt.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
+                            Votes = trakt.Votes,
+                            Url = trakt.Url
+                        });
+                        changed = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Trakt season augmentation failed for {Key}", cacheKey);
+                }
+            }
+
+            if (needsSeasonTmdb && !HasRatingSource(env.Data, "tmdb"))
+            {
+                try
+                {
+                    var tmdb = await _tmdbSeason.LookupSeasonAsync(showTmdbId, showImdbId, showTvdbId, seasonNumber, cfg.TmdbApiAuth, cancellationToken).ConfigureAwait(false);
+                    if (tmdb is not null && tmdb.AverageRating > 0)
+                    {
+                        UpsertRating(env.Data, new MdbListRating
+                        {
+                            Source = "tmdb",
+                            Value = Math.Round(tmdb.AverageRating, 1, MidpointRounding.AwayFromZero),
+                            Score = Math.Round(tmdb.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
+                            Votes = tmdb.Votes,
+                            Url = tmdb.Url
+                        });
+                        if (env.Data.Ids is null || !env.Data.Ids.Tmdb.HasValue)
+                        {
+                            EnsureIds(env.Data, tmdb.SeriesTmdbId.ToString(), showImdbId);
+                        }
+                        changed = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "TMDb season augmentation failed for {Key}", cacheKey);
+                }
+            }
+
+            if (changed)
+            {
+                env.CachedAtUtc = now;
+                await _cacheStore.SaveAsync(cacheKey, env, cancellationToken).ConfigureAwait(false);
+            }
+
+            return new FetchResult { Data = env.Data, Outcome = UpdateOutcome.Skipped };
+        }
+
+        var cached = await _cacheStore.TryGetAsync(cacheKey, cancellationToken).ConfigureAwait(false);
+        if (cached is not null && (now - cached.CachedAtUtc) <= ttl)
+        {
+            return await ReturnSeasonCacheAsync(cached).ConfigureAwait(false);
+        }
+
+        var data = cached?.Data ?? new MdbListTitleResponse
+        {
+            Type = "season",
+            Ids = new MdbListIds
+            {
+                Imdb = NormalizeImdbId(showImdbId),
+                Tmdb = int.TryParse(NormalizeDigits(showTmdbId), out var parsedTmdb) ? parsedTmdb : null
+            }
+        };
+        EnsureIds(data, showTmdbId, showImdbId);
+
+        if (needsSeasonTrakt && !HasRatingSource(data, "trakt"))
+        {
+            var lookup = await _traktSeason.LookupSeasonAsync(showImdbId, showTvdbId, seasonNumber, cfg.TraktClientId, cancellationToken).ConfigureAwait(false);
+            if (lookup is not null && lookup.AverageRating > 0)
+            {
+                UpsertRating(data, new MdbListRating
+                {
+                    Source = "trakt",
+                    Value = Math.Round(lookup.AverageRating, 1, MidpointRounding.AwayFromZero),
+                    Score = Math.Round(lookup.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
+                    Votes = lookup.Votes,
+                    Url = lookup.Url
+                });
+            }
+        }
+
+        if (needsSeasonTmdb && !HasRatingSource(data, "tmdb"))
+        {
+            var lookup = await _tmdbSeason.LookupSeasonAsync(showTmdbId, showImdbId, showTvdbId, seasonNumber, cfg.TmdbApiAuth, cancellationToken).ConfigureAwait(false);
+            if (lookup is not null && lookup.AverageRating > 0)
+            {
+                UpsertRating(data, new MdbListRating
+                {
+                    Source = "tmdb",
+                    Value = Math.Round(lookup.AverageRating, 1, MidpointRounding.AwayFromZero),
+                    Score = Math.Round(lookup.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
+                    Votes = lookup.Votes,
+                    Url = lookup.Url
+                });
+                EnsureIds(data, lookup.SeriesTmdbId.ToString(), showImdbId);
+            }
+        }
+
+        if (data.Ratings.Count == 0)
+        {
+            if (cached is not null)
+            {
+                return new FetchResult { Data = cached.Data, Outcome = UpdateOutcome.Skipped };
+            }
+
+            return new FetchResult { Data = null, Outcome = UpdateOutcome.Failed };
+        }
+
+        var env = new MdbListCacheStore.CacheEnvelope
+        {
+            CachedAtUtc = now,
+            Data = data,
+            RawJson = needsSeasonTmdb && needsSeasonTrakt
+                ? "{\"source\":\"season-multi\"}"
+                : needsSeasonTmdb
+                    ? "{\"source\":\"tmdb-season\"}"
+                    : "{\"source\":\"trakt-season\"}"
+        };
+
+        await _cacheStore.SaveAsync(cacheKey, env, cancellationToken).ConfigureAwait(false);
+        return new FetchResult { Data = data, Outcome = UpdateOutcome.Skipped };
+    }
+
+    private async Task<FetchResult> GetCachedOrFetchAsync(
+        string contentType,
+        string? tmdbId,
+        string? imdbId,
+        string? tvdbId,
+        PluginConfiguration cfg,
+        bool needsMdbList,
+        bool needsTvMaze,
+        CancellationToken cancellationToken)
+    {
+        var cacheKey = BuildCacheKey(contentType, tmdbId, imdbId, tvdbId);
+        if (string.IsNullOrWhiteSpace(cacheKey))
+        {
+            return new FetchResult { Data = null, Outcome = UpdateOutcome.Skipped };
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var ttl = GetTtl(cfg);
+
+        async Task<FetchResult> ReturnFreshOrAugmentedCacheAsync(MdbListCacheStore.CacheEnvelope env)
+        {
+            if (needsTvMaze && !HasRatingSource(env.Data, "tvmaze"))
+            {
+                try
+                {
+                    var tvmazeRating = await TryFetchTvMazeRatingAsync(imdbId, tvdbId, cancellationToken).ConfigureAwait(false);
+                    if (tvmazeRating is not null)
+                    {
+                        EnsureIds(env.Data, tmdbId, imdbId);
+                        UpsertRating(env.Data, tvmazeRating);
+                        env.CachedAtUtc = now;
+                        await _cacheStore.SaveAsync(cacheKey, env, cancellationToken).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "TVMaze augmentation failed for {Key}", cacheKey);
+                }
+            }
+
+            var imdbFallback = TryExtractImdbFallbackCommunityRating(env);
+            if (imdbFallback.HasValue)
+            {
+                return new FetchResult { Data = null, Outcome = UpdateOutcome.Skipped, ImdbFallbackCommunityRating = imdbFallback.Value };
+            }
+
+            return new FetchResult { Data = env.Data, Outcome = UpdateOutcome.Skipped };
+        }
+
+        var cached = await _cacheStore.TryGetAsync(cacheKey, cancellationToken).ConfigureAwait(false);
+        if (cached is not null)
+        {
+            var age = now - cached.CachedAtUtc;
+            if (age <= ttl)
+            {
+                return await ReturnFreshOrAugmentedCacheAsync(cached).ConfigureAwait(false);
+            }
+        }
+
+        if (_rateLimit.NotBeforeUtc.HasValue && _rateLimit.NotBeforeUtc.Value > now)
+        {
+            if (cached is not null)
+            {
+                return await ReturnFreshOrAugmentedCacheAsync(cached).ConfigureAwait(false);
+            }
+
+            _logger.LogWarning(
+                "MDBList rate limit cooldown is active until {NotBeforeUtc:o}, but no cache is available for {Key}. Revalidating with a live request.",
+                _rateLimit.NotBeforeUtc.Value,
+                cacheKey);
+        }
+
+        MdbListTitleResponse? data = null;
+        string? rawJson = cached?.RawJson;
+        bool stopAfterThis = false;
+
+        if (needsMdbList)
+        {
+            if (cfg.RequestDelayMs > 0)
+            {
+                await Task.Delay(cfg.RequestDelayMs, cancellationToken).ConfigureAwait(false);
+            }
+
+            var api = await _client.GetByTmdbAsync(contentType, tmdbId ?? string.Empty, cfg.MdbListApiKey, cancellationToken).ConfigureAwait(false);
+            rawJson = api.RawJson;
+            var quotaExhausted = api.RateLimitRemaining.HasValue && api.RateLimitRemaining.Value <= 0;
+
+            await _rateLimit.UpdateAsync(api.RateLimitLimit, api.RateLimitRemaining, api.RateLimitResetUtc, api.IsRateLimited || quotaExhausted, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (api.IsRateLimited)
+            {
+                if (cached is not null)
+                {
+                    _logger.LogWarning("MDBList rate limit reached. Using stale cache for {Key}.", cacheKey);
+                    return await ReturnFreshOrAugmentedCacheAsync(cached).ConfigureAwait(false);
+                }
+
+                _logger.LogWarning(
+                    "MDBList rate limit reached. Will continue after {ResetUtc:o}.",
+                    api.RateLimitResetUtc ?? (_rateLimit.NotBeforeUtc ?? now.AddHours(24)));
+                return new FetchResult { Data = null, Outcome = UpdateOutcome.RateLimited };
+            }
+
+            stopAfterThis = quotaExhausted;
+
+            if (api.Data is null)
+            {
+                if (needsTvMaze)
+                {
+                    try
+                    {
+                        var tvmazeRating = await TryFetchTvMazeRatingAsync(imdbId, tvdbId, cancellationToken).ConfigureAwait(false);
+                        if (tvmazeRating is not null)
+                        {
+                            data = new MdbListTitleResponse
+                            {
+                                Type = contentType,
+                                Ids = new MdbListIds { Imdb = NormalizeImdbId(imdbId), Tmdb = int.TryParse(tmdbId, out var tmdbParsed) ? tmdbParsed : null },
+                                Ratings = new System.Collections.Generic.List<MdbListRating> { tvmazeRating }
+                            };
+
+                            var tvEnv = new MdbListCacheStore.CacheEnvelope
+                            {
+                                CachedAtUtc = now,
+                                Data = data,
+                                RawJson = "{\"source\":\"tvmaze-only\"}"
+                            };
+                            await _cacheStore.SaveAsync(cacheKey, tvEnv, cancellationToken).ConfigureAwait(false);
+                            return new FetchResult { Data = data, Outcome = UpdateOutcome.Skipped, StopAfterThis = stopAfterThis };
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "TVMaze fallback failed for {Key}", cacheKey);
+                    }
+                }
+
+                if (api.StatusCode == 404 && !string.IsNullOrWhiteSpace(imdbId))
+                {
+                    try
+                    {
+                        var imdbFallback = await _imdbFallback.TryGetRatingInfoAsync(imdbId, ttl, cancellationToken).ConfigureAwait(false);
+                        if (imdbFallback.HasValue && imdbFallback.Value.AverageRating > 0)
+                        {
+                            var synthetic = new MdbListTitleResponse
+                            {
+                                Type = contentType,
+                                Ids = new MdbListIds { Imdb = imdbId, Tmdb = int.TryParse(tmdbId, out var t) ? t : null },
+                                Ratings = new System.Collections.Generic.List<MdbListRating>
+                                {
+                                    new MdbListRating { Source = "imdb", Value = imdbFallback.Value.AverageRating, Votes = imdbFallback.Value.Votes, Url = "https://www.imdb.com/title/" + imdbId.Trim() }
+                                }
+                            };
+
+                            var env404 = new MdbListCacheStore.CacheEnvelope
+                            {
+                                CachedAtUtc = now,
+                                Data = synthetic,
+                                RawJson = "{\"source\":\"imdb-fallback\",\"reason\":\"mdblist-404\"}"
+                            };
+                            await _cacheStore.SaveAsync(cacheKey, env404, cancellationToken).ConfigureAwait(false);
+
+                            return new FetchResult { Data = null, Outcome = UpdateOutcome.Skipped, ImdbFallbackCommunityRating = imdbFallback.Value.AverageRating };
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "IMDb fallback failed for {ImdbId} (TMDb {TmdbId})", imdbId, tmdbId);
+                    }
+                }
+
+                if (cached is not null)
+                {
+                    return await ReturnFreshOrAugmentedCacheAsync(cached).ConfigureAwait(false);
+                }
+
+                return new FetchResult { Data = null, Outcome = UpdateOutcome.Failed };
+            }
+
+            data = api.Data;
+        }
+        else
+        {
+            data = cached?.Data ?? new MdbListTitleResponse
+            {
+                Type = contentType,
+                Ids = new MdbListIds { Imdb = NormalizeImdbId(imdbId), Tmdb = int.TryParse(tmdbId, out var onlyTvMazeTmdb) ? onlyTvMazeTmdb : null }
+            };
+        }
+
+        EnsureIds(data, tmdbId, imdbId);
+
+        if (needsTvMaze && !HasRatingSource(data, "tvmaze"))
+        {
+            try
+            {
+                var tvmazeRating = await TryFetchTvMazeRatingAsync(imdbId, tvdbId, cancellationToken).ConfigureAwait(false);
+                if (tvmazeRating is not null)
+                {
+                    UpsertRating(data, tvmazeRating);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "TVMaze request failed for {Key}", cacheKey);
+            }
+        }
+
+        var env = new MdbListCacheStore.CacheEnvelope
+        {
+            CachedAtUtc = now,
+            Data = data,
+            RawJson = needsMdbList ? rawJson : "{\"source\":\"tvmaze-only\"}"
+        };
+
+        await _cacheStore.SaveAsync(cacheKey, env, cancellationToken).ConfigureAwait(false);
+        return new FetchResult { Data = data, Outcome = UpdateOutcome.Skipped, StopAfterThis = stopAfterThis };
     }
 
     private static TimeSpan GetTtl(PluginConfiguration cfg)

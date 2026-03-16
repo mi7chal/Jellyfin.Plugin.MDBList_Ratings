@@ -60,6 +60,8 @@ internal sealed class MdbListClient
                     return new MdbListApiResult
                     {
                         Url = url,
+                        StatusCode = (int)response.StatusCode,
+                        ReasonPhrase = response.ReasonPhrase,
                         RateLimitLimit = limit,
                         RateLimitRemaining = remaining,
                         RateLimitResetUtc = resetUtc,
@@ -72,6 +74,8 @@ internal sealed class MdbListClient
                 return new MdbListApiResult
                 {
                     Url = url,
+                    StatusCode = (int)response.StatusCode,
+                    ReasonPhrase = response.ReasonPhrase,
                     RateLimitLimit = limit,
                     RateLimitRemaining = remaining,
                     RateLimitResetUtc = resetUtc,
@@ -85,6 +89,8 @@ internal sealed class MdbListClient
             return new MdbListApiResult
             {
                 Url = url,
+                StatusCode = (int)response.StatusCode,
+                ReasonPhrase = response.ReasonPhrase,
                 RateLimitLimit = limit,
                 RateLimitRemaining = remaining,
                 RateLimitResetUtc = resetUtc,

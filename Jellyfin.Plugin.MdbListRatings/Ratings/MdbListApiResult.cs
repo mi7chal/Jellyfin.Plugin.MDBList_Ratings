@@ -5,6 +5,8 @@ namespace Jellyfin.Plugin.MdbListRatings.Ratings;
 internal sealed class MdbListApiResult
 {
     public string Url { get; init; } = string.Empty;
+    public int? StatusCode { get; init; }
+    public string? ReasonPhrase { get; init; }
     public int? RateLimitLimit { get; init; }
     public int? RateLimitRemaining { get; init; }
     public DateTimeOffset? RateLimitResetUtc { get; init; }
