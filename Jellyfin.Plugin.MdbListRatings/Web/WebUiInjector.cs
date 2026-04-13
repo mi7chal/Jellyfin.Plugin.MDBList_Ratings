@@ -282,22 +282,61 @@ internal static class WebUiInjector
       document.head.appendChild(style);
     }
 
-    // Load plugin configuration once to check whether icons are enabled.
+    // Load safe web-client settings once.
+    // Unlike getPluginConfiguration(), this endpoint is intended for regular users too
+    // and does not expose secrets such as API keys.
+    var _webClientSettings = null;
+    var _webClientSettingsPromise = null;
+
+    function getDefaultWebClientSettings(){
+      return {
+        enableWebRatingSourceIcon: true,
+        enableWebAllRatingsFromCache: false,
+        webAllRatingsMode: 'all',
+        webAllRatingsOrderCsv: '',
+        enableWebExtraTomatoesCertified: false,
+        enableWebExtraRottenVerified: false,
+        enableWebExtraMetacriticMustSee: false,
+        enableWebExtraAniList: false,
+        enableWebClickableRatingIcons: false,
+        enableImdbTop250Icon: false,
+        enableWebAwardBadges: false,
+        webAwardKeysCsv: '',
+        enableWebAwardNominationsBadge: false
+      };
+    }
+
+    function ensureWebClientSettings(){
+      if (_webClientSettings !== null) return Promise.resolve(_webClientSettings);
+      if (_webClientSettingsPromise) return _webClientSettingsPromise;
+
+      if (!hasApiClient()) {
+        _webClientSettings = getDefaultWebClientSettings();
+        return Promise.resolve(_webClientSettings);
+      }
+
+      var url = window.ApiClient.getUrl('Plugins/MdbListRatings/WebClientSettings', {});
+      _webClientSettingsPromise = ajaxJson(url).then(function(cfg){
+        _webClientSettings = cfg || getDefaultWebClientSettings();
+        return _webClientSettings;
+      }).catch(function(){
+        _webClientSettings = getDefaultWebClientSettings();
+        return _webClientSettings;
+      }).finally(function(){
+        _webClientSettingsPromise = null;
+      });
+
+      return _webClientSettingsPromise;
+    }
+
     var _iconsEnabled = null;
     var _iconsEnabledPromise = null;
     function ensureIconsEnabled(){
       if (_iconsEnabled !== null) return Promise.resolve(_iconsEnabled);
       if (_iconsEnabledPromise) return _iconsEnabledPromise;
 
-      // If ApiClient isn't ready or doesn't expose getPluginConfiguration, default to enabled.
-      if (!hasApiClient() || !window.ApiClient.getPluginConfiguration) {
-        _iconsEnabled = true;
-        return Promise.resolve(true);
-      }
-
-      _iconsEnabledPromise = window.ApiClient.getPluginConfiguration(PLUGIN_ID).then(function(cfg){
-        // Default: enabled.
-        var v = (cfg && (cfg.EnableWebRatingSourceIcon !== false));
+      _iconsEnabledPromise = ensureWebClientSettings().then(function(cfg){
+        var v = (cfg && (cfg.enableWebRatingSourceIcon !== false));
         _iconsEnabled = !!v;
         return _iconsEnabled;
       }).catch(function(){
@@ -344,24 +383,19 @@ internal static class WebUiInjector
       if (_allRatingsSettings !== null) return Promise.resolve(_allRatingsSettings);
       if (_allRatingsSettingsPromise) return _allRatingsSettingsPromise;
 
-      // If ApiClient isn't ready or doesn't expose getPluginConfiguration, default to disabled.
-      if (!hasApiClient() || !window.ApiClient.getPluginConfiguration){
-        _allRatingsSettings = { enabled: false, mode: 'all', order: [], extras: { tc:false, rv:false, mc:false, al:false }, clickable: false, top250: false, awards: { enabled: false, keys: [], nominations: false } };
-        return Promise.resolve(_allRatingsSettings);
-      }
-
-      _allRatingsSettingsPromise = window.ApiClient.getPluginConfiguration(PLUGIN_ID).then(function(cfg){
-        var enabled = !!(cfg && (cfg.EnableWebAllRatingsFromCache === true));
-        var mode = normalizeAllRatingsMode(cfg ? (cfg.WebAllRatingsMode || cfg.webAllRatingsMode) : null);
-        var orderRaw = cfg ? (cfg.WebAllRatingsOrderCsv || cfg.webAllRatingsOrderCsv || cfg.WebAllRatingsOrder || cfg.webAllRatingsOrder || '') : '';
+      _allRatingsSettingsPromise = ensureWebClientSettings().then(function(cfg){
+        cfg = cfg || getDefaultWebClientSettings();
+        var enabled = !!(cfg && (cfg.enableWebAllRatingsFromCache === true));
+        var mode = normalizeAllRatingsMode(cfg ? (cfg.webAllRatingsMode || cfg.WebAllRatingsMode) : null);
+        var orderRaw = cfg ? (cfg.webAllRatingsOrderCsv || cfg.WebAllRatingsOrderCsv || cfg.WebAllRatingsOrder || cfg.webAllRatingsOrder || '') : '';
         var order = parseSourcesList(orderRaw);
         var extras = {
-          tc: !!(cfg && (cfg.EnableWebExtraTomatoesCertified === true)),
-          rv: !!(cfg && (cfg.EnableWebExtraRottenVerified === true)),
-          mc: !!(cfg && (cfg.EnableWebExtraMetacriticMustSee === true)),
-          al: !!(cfg && (cfg.EnableWebExtraAniList === true))
+          tc: !!(cfg && (cfg.enableWebExtraTomatoesCertified === true)),
+          rv: !!(cfg && (cfg.enableWebExtraRottenVerified === true)),
+          mc: !!(cfg && (cfg.enableWebExtraMetacriticMustSee === true)),
+          al: !!(cfg && (cfg.enableWebExtraAniList === true))
         };
-        _allRatingsSettings = { enabled: enabled, mode: mode, order: order, extras: extras, clickable: !!(cfg && (cfg.EnableWebClickableRatingIcons === true)), top250: !!(cfg && (cfg.EnableImdbTop250Icon === true)), awards: { enabled: !!(cfg && (cfg.EnableWebAwardBadges === true)), keys: parseSourcesList(cfg ? (cfg.WebAwardKeysCsv || cfg.webAwardKeysCsv || '') : ''), nominations: !!(cfg && (cfg.EnableWebAwardNominationsBadge === true)) } };
+        _allRatingsSettings = { enabled: enabled, mode: mode, order: order, extras: extras, clickable: !!(cfg && (cfg.enableWebClickableRatingIcons === true)), top250: !!(cfg && (cfg.enableImdbTop250Icon === true)), awards: { enabled: !!(cfg && (cfg.enableWebAwardBadges === true)), keys: parseSourcesList(cfg ? (cfg.webAwardKeysCsv || cfg.WebAwardKeysCsv || '') : ''), nominations: !!(cfg && (cfg.enableWebAwardNominationsBadge === true)) } };
         return _allRatingsSettings;
       }).catch(function(){
         _allRatingsSettings = { enabled: false, mode: 'all', order: [], extras: { tc:false, rv:false, mc:false, al:false }, clickable: false, top250: false, awards: { enabled: false, keys: [], nominations: false } };
