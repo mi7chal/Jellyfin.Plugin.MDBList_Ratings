@@ -715,6 +715,20 @@ internal sealed class RatingsUpdater
             return (null, null);
         }
 
+        // Special-case Letterboxd for CommunityRating: keep the provider native 0-5 value
+        // instead of converting the normalized 0-100 score back to Jellyfin's 0-10 scale.
+        // This preserves the exact number the user selected in settings.
+        if (string.Equals(resolved.UsedSource, "letterboxd", StringComparison.OrdinalIgnoreCase))
+        {
+            var letterboxdRating = data.Ratings.FirstOrDefault(r => string.Equals(r.Source, resolved.UsedSource, StringComparison.OrdinalIgnoreCase));
+            var nativeValue = letterboxdRating?.Value;
+            if (nativeValue.HasValue && !double.IsNaN(nativeValue.Value) && !double.IsInfinity(nativeValue.Value) && nativeValue.Value > 0)
+            {
+                var nativeCommunity = (float)Math.Round(nativeValue.Value, 1, MidpointRounding.AwayFromZero);
+                return (nativeCommunity > 0 ? nativeCommunity : null, resolved.UsedSource);
+            }
+        }
+
         // Jellyfin CommunityRating is 0-10; MDBList score is 0-100.
         var s = Clamp(resolved.Score0To100.Value, 0, 100);
         var value = (float)Math.Round(s / 10.0, 1, MidpointRounding.AwayFromZero);
