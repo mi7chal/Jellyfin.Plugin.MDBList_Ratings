@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -35,11 +36,13 @@ internal sealed class FilmwebClient
     private static DateTimeOffset _nextAllowedUtc = DateTimeOffset.MinValue;
     private static readonly TimeSpan MinSpacing = TimeSpan.FromMilliseconds(850);
     private static readonly TimeSpan DefaultCacheTtl = TimeSpan.FromHours(8);
-    private static readonly Regex SearchHrefRegex = new("href=\"(?<url>/(?:film|serial)/[^\"]+)\"", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ScriptJsonLdRegex = new("<script[^>]+type=\"application/ld\\+json\"[^>]*>(?<json>[\\s\\S]*?)</script>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DataRateRegex = new("class=\"filmRating[^\\\"]*\"[^>]*data-rate=\"(?<value>[0-9]+(?:[\\.,][0-9]+)?)\"", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DataCountRegex = new("class=\"filmRating[^\\\"]*\"[^>]*data-count=\"(?<value>[0-9\\s]+)\"", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex RatingValueFallbackRegex = new("\"ratingValue\"\\s*:\\s*\"?(?<value>[0-9]+(?:[\\.,][0-9]+)?)\"?", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex RatingCountFallbackRegex = new("\"ratingCount\"\\s*:\\s*\"?(?<value>[0-9\\s]+)\"?", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex FilmwebIdRegex = new("-(?<id>[0-9]+)(?:\\?|#|$)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
     public FilmwebClient(IHttpClientFactory httpClientFactory, ILogger logger)
     {
@@ -75,34 +78,18 @@ internal sealed class FilmwebClient
 
     private async Task<FilmwebLookupResult?> LookupCoreAsync(string contentType, string? imdbId, string? title, int? year, CancellationToken cancellationToken)
     {
-        var searchQueries = new List<string>(2);
-        if (!string.IsNullOrWhiteSpace(imdbId))
+        var queries = BuildSearchQueries(imdbId, title, year);
+        foreach (var query in queries)
         {
-            searchQueries.Add(imdbId!);
-        }
-
-        var titleQuery = BuildTitleQuery(title, year);
-        if (!string.IsNullOrWhiteSpace(titleQuery))
-        {
-            searchQueries.Add(titleQuery!);
-        }
-
-        foreach (var query in searchQueries)
-        {
-            var searchUrl = $"https://www.filmweb.pl/search?q={Uri.EscapeDataString(query)}";
-            var html = await GetStringWithThrottleAsync(searchUrl, cancellationToken).ConfigureAwait(false);
-            if (string.IsNullOrWhiteSpace(html))
+            var hit = await SearchBestHitAsync(contentType, query, title, cancellationToken).ConfigureAwait(false);
+            if (hit is null)
             {
                 continue;
             }
 
-            var candidateUrl = TryExtractCandidateUrl(contentType, html);
-            if (string.IsNullOrWhiteSpace(candidateUrl))
-            {
-                continue;
-            }
-
-            var result = await TryParseRatingPageAsync(candidateUrl!, cancellationToken).ConfigureAwait(false);
+            // Stable Filmweb resolver: /film?id=<id> redirects to canonical /film|/serial/... page.
+            var candidateUrl = $"https://www.filmweb.pl/film?id={hit.Id.ToString(CultureInfo.InvariantCulture)}";
+            var result = await TryParseRatingPageAsync(candidateUrl, hit.Id.ToString(CultureInfo.InvariantCulture), cancellationToken).ConfigureAwait(false);
             if (result is not null)
             {
                 return result;
@@ -112,9 +99,9 @@ internal sealed class FilmwebClient
         return null;
     }
 
-    private async Task<FilmwebLookupResult?> TryParseRatingPageAsync(string url, CancellationToken cancellationToken)
+    private async Task<FilmwebLookupResult?> TryParseRatingPageAsync(string url, string? fallbackFilmwebId, CancellationToken cancellationToken)
     {
-        var html = await GetStringWithThrottleAsync(url, cancellationToken).ConfigureAwait(false);
+        var html = await GetStringWithThrottleAsync(url, cancellationToken, false).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(html))
         {
             return null;
@@ -125,7 +112,7 @@ internal sealed class FilmwebClient
             return null;
         }
 
-        var filmwebId = TryExtractFilmwebId(url);
+        var filmwebId = TryExtractFilmwebId(url) ?? NormalizeDigits(fallbackFilmwebId);
         return new FilmwebLookupResult
         {
             AverageRating = rating,
@@ -135,7 +122,7 @@ internal sealed class FilmwebClient
         };
     }
 
-    private async Task<string?> GetStringWithThrottleAsync(string url, CancellationToken cancellationToken)
+    private async Task<string?> GetStringWithThrottleAsync(string url, CancellationToken cancellationToken, bool expectJson)
     {
         for (var attempt = 0; attempt < 3; attempt++)
         {
@@ -153,7 +140,15 @@ internal sealed class FilmwebClient
                 http.Timeout = TimeSpan.FromSeconds(20);
                 using var request = new HttpRequestMessage(HttpMethod.Get, url);
                 request.Headers.UserAgent.ParseAdd("Jellyfin.Plugin.MdbListRatings/1.0 (+filmweb)");
-                request.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+                if (expectJson)
+                {
+                    request.Headers.Accept.ParseAdd("application/json,text/plain,*/*");
+                }
+                else
+                {
+                    request.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+                }
+
                 request.Headers.AcceptLanguage.ParseAdd("pl-PL,pl;q=0.9,en-US;q=0.7,en;q=0.5");
 
                 using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
@@ -198,33 +193,76 @@ internal sealed class FilmwebClient
         return null;
     }
 
-    private static string? TryExtractCandidateUrl(string contentType, string searchHtml)
+    private async Task<SearchHit?> SearchBestHitAsync(string contentType, string query, string? expectedTitle, CancellationToken cancellationToken)
     {
-        var expectPrefix = contentType == "movie" ? "/film/" : "/serial/";
-        string? fallback = null;
-        foreach (Match match in SearchHrefRegex.Matches(searchHtml))
+        var searchUrl = $"https://www.filmweb.pl/api/v1/search?q={Uri.EscapeDataString(query)}";
+        var json = await GetStringWithThrottleAsync(searchUrl, cancellationToken, true).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(json))
         {
-            var rel = match.Groups["url"].Value;
-            if (string.IsNullOrWhiteSpace(rel))
-            {
-                continue;
-            }
-
-            if (rel.StartsWith(expectPrefix, StringComparison.OrdinalIgnoreCase))
-            {
-                return ToAbsolute(rel);
-            }
-
-            fallback ??= rel;
+            return null;
         }
 
-        return string.IsNullOrWhiteSpace(fallback) ? null : ToAbsolute(fallback);
+        try
+        {
+            var payload = JsonSerializer.Deserialize<SearchResponse>(json, JsonOptions);
+            if (payload?.SearchHits is null || payload.SearchHits.Count == 0)
+            {
+                return null;
+            }
+
+            var expectedType = contentType == "movie" ? "film" : "serial";
+            var candidates = payload.SearchHits
+                .Where(h => h is not null && h.Id > 0 && string.Equals(h.Type, expectedType, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (candidates.Count == 0)
+            {
+                return null;
+            }
+
+            var normalizedExpected = NormalizeTitle(expectedTitle);
+            if (string.IsNullOrWhiteSpace(normalizedExpected))
+            {
+                return candidates[0];
+            }
+
+            SearchHit? best = null;
+            var bestScore = int.MinValue;
+            foreach (var candidate in candidates)
+            {
+                var score = ScoreTitleMatch(normalizedExpected!, candidate.MatchedTitle);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = candidate;
+                }
+            }
+
+            return best ?? candidates[0];
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Filmweb search JSON parse failed for query '{Query}'", query);
+            return null;
+        }
     }
 
     private static bool TryExtractRating(string html, out double rating0To10, out int? votes)
     {
         rating0To10 = 0;
         votes = null;
+
+        var dataRateMatch = DataRateRegex.Match(html);
+        if (dataRateMatch.Success && TryParseDouble(dataRateMatch.Groups["value"].Value, out var dataRate) && dataRate > 0)
+        {
+            rating0To10 = dataRate;
+            var dataCountMatch = DataCountRegex.Match(html);
+            if (dataCountMatch.Success && TryParseInt(dataCountMatch.Groups["value"].Value, out var dataVotes))
+            {
+                votes = dataVotes;
+            }
+            return true;
+        }
 
         foreach (Match match in ScriptJsonLdRegex.Matches(html))
         {
@@ -334,15 +372,97 @@ internal sealed class FilmwebClient
         return false;
     }
 
-    private static string ToAbsolute(string relativeOrAbsolute)
+    private static int ScoreTitleMatch(string expectedTitle, string? candidateTitle)
     {
-        if (relativeOrAbsolute.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-            || relativeOrAbsolute.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(candidateTitle))
         {
-            return relativeOrAbsolute;
+            return 0;
         }
 
-        return "https://www.filmweb.pl" + (relativeOrAbsolute.StartsWith("/", StringComparison.Ordinal) ? relativeOrAbsolute : "/" + relativeOrAbsolute);
+        var expected = NormalizeForMatch(expectedTitle);
+        var candidate = NormalizeForMatch(candidateTitle);
+        if (expected.Length == 0 || candidate.Length == 0)
+        {
+            return 0;
+        }
+
+        if (string.Equals(expected, candidate, StringComparison.Ordinal))
+        {
+            return 1000;
+        }
+
+        if (candidate.Contains(expected, StringComparison.Ordinal))
+        {
+            return 600;
+        }
+
+        if (expected.Contains(candidate, StringComparison.Ordinal))
+        {
+            return 500;
+        }
+
+        var commonPrefix = 0;
+        var len = Math.Min(expected.Length, candidate.Length);
+        while (commonPrefix < len && expected[commonPrefix] == candidate[commonPrefix])
+        {
+            commonPrefix++;
+        }
+
+        return commonPrefix;
+    }
+
+    private static List<string> BuildSearchQueries(string? imdbId, string? title, int? year)
+    {
+        var queries = new List<string>(3);
+        if (!string.IsNullOrWhiteSpace(imdbId))
+        {
+            queries.Add(imdbId!);
+        }
+
+        if (!string.IsNullOrWhiteSpace(title))
+        {
+            var titleOnly = title!;
+            var titleWithYear = year.HasValue && year.Value > 1800
+                ? $"{titleOnly} {year.Value.ToString(CultureInfo.InvariantCulture)}"
+                : null;
+
+            if (!string.IsNullOrWhiteSpace(titleWithYear))
+            {
+                queries.Add(titleWithYear!);
+            }
+
+            queries.Add(titleOnly);
+        }
+
+        return queries
+            .Select(q => (q ?? string.Empty).Trim())
+            .Where(q => !string.IsNullOrWhiteSpace(q))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string NormalizeForMatch(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var v = value.Trim().ToLowerInvariant();
+        var sb = new System.Text.StringBuilder(v.Length);
+        foreach (var ch in v)
+        {
+            if (char.IsLetterOrDigit(ch))
+            {
+                sb.Append(ch);
+            }
+            else if (char.IsWhiteSpace(ch))
+            {
+                sb.Append(' ');
+            }
+        }
+
+        return sb.ToString().Replace("  ", " ", StringComparison.Ordinal).Trim();
     }
 
     private static string? TryExtractFilmwebId(string? url)
@@ -356,16 +476,16 @@ internal sealed class FilmwebClient
         return match.Success ? match.Groups["id"].Value : null;
     }
 
-    private static string? BuildTitleQuery(string? title, int? year)
+    private sealed class SearchResponse
     {
-        if (string.IsNullOrWhiteSpace(title))
-        {
-            return null;
-        }
+        public List<SearchHit> SearchHits { get; set; } = new();
+    }
 
-        return year.HasValue && year.Value > 1800
-            ? $"{title} {year.Value.ToString(CultureInfo.InvariantCulture)}"
-            : title;
+    private sealed class SearchHit
+    {
+        public int Id { get; set; }
+        public string? Type { get; set; }
+        public string? MatchedTitle { get; set; }
     }
 
     private static string? NormalizeContentType(string? contentType)

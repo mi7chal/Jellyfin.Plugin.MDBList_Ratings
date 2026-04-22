@@ -1144,6 +1144,23 @@ internal sealed class RatingsUpdater
         try
         {
             var normalized = url.Trim();
+            var queryIdIndex = normalized.IndexOf("?id=", StringComparison.OrdinalIgnoreCase);
+            if (queryIdIndex >= 0)
+            {
+                var fromQuery = normalized[(queryIdIndex + 4)..];
+                var stopIdx = fromQuery.IndexOfAny(new[] { '&', '#', '/' });
+                if (stopIdx >= 0)
+                {
+                    fromQuery = fromQuery[..stopIdx];
+                }
+
+                var qid = NormalizeDigits(fromQuery);
+                if (!string.IsNullOrWhiteSpace(qid))
+                {
+                    return qid;
+                }
+            }
+
             var dash = normalized.LastIndexOf('-');
             if (dash < 0 || dash + 1 >= normalized.Length)
             {
