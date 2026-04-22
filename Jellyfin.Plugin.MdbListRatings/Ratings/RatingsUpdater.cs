@@ -232,7 +232,9 @@ internal sealed class RatingsUpdater
             if (isMovie)
             {
                 // Movie: community + critic
-                if (!allowUpdateCommunity && !allowUpdateCritic)
+                // Still allow cache augmentation for web-only providers (Filmweb) even when
+                // metadata fields are already filled and won't be overwritten.
+                if (!allowUpdateCommunity && !allowUpdateCritic && !needsFilmweb)
                 {
                     return UpdateOutcome.Skipped;
                 }
@@ -253,9 +255,9 @@ internal sealed class RatingsUpdater
             }
             else
             {
-                // Series: still allow fetching/augmenting the cache (e.g. TVmaze) even when we
+                // Series: still allow fetching/augmenting the cache (e.g. TVmaze/Filmweb) even when we
                 // are not going to overwrite the saved CommunityRating field.
-                if (!allowUpdateCommunity && !needsTvMaze)
+                if (!allowUpdateCommunity && !needsTvMaze && !needsFilmweb)
                 {
                     return UpdateOutcome.Skipped;
                 }
