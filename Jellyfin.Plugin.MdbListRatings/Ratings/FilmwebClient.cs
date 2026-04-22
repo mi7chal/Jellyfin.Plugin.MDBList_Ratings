@@ -5,7 +5,6 @@ using System.Globalization;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -36,12 +35,6 @@ internal sealed class FilmwebClient
     private static DateTimeOffset _nextAllowedUtc = DateTimeOffset.MinValue;
     private static readonly TimeSpan MinSpacing = TimeSpan.FromMilliseconds(850);
     private static readonly TimeSpan DefaultCacheTtl = TimeSpan.FromHours(8);
-    private static readonly Regex ScriptJsonLdRegex = new("<script[^>]+type=\"application/ld\\+json\"[^>]*>(?<json>[\\s\\S]*?)</script>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex DataRateRegex = new("class=\"filmRating[^\\\"]*\"[^>]*data-rate=\"(?<value>[0-9]+(?:[\\.,][0-9]+)?)\"", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex DataCountRegex = new("class=\"filmRating[^\\\"]*\"[^>]*data-count=\"(?<value>[0-9\\s]+)\"", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex RatingValueFallbackRegex = new("\"ratingValue\"\\s*:\\s*\"?(?<value>[0-9]+(?:[\\.,][0-9]+)?)\"?", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex RatingCountFallbackRegex = new("\"ratingCount\"\\s*:\\s*\"?(?<value>[0-9\\s]+)\"?", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex FilmwebIdRegex = new("-(?<id>[0-9]+)(?:\\?|#|$)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
     public FilmwebClient(IHttpClientFactory httpClientFactory, ILogger logger)
@@ -87,39 +80,52 @@ internal sealed class FilmwebClient
                 continue;
             }
 
-            // Stable Filmweb resolver: /film?id=<id> redirects to canonical /film|/serial/... page.
-            var candidateUrl = $"https://www.filmweb.pl/film?id={hit.Id.ToString(CultureInfo.InvariantCulture)}";
-            var result = await TryParseRatingPageAsync(candidateUrl, hit.Id.ToString(CultureInfo.InvariantCulture), cancellationToken).ConfigureAwait(false);
-            if (result is not null)
+            var rating = await GetRatingAsync(hit.Id, cancellationToken).ConfigureAwait(false);
+            if (rating is not null)
             {
-                return result;
+                return new FilmwebLookupResult
+                {
+                    AverageRating = rating.Rate,
+                    Votes = rating.Count > 0 ? rating.Count : null,
+                    // Stable API-only URL form. Filmweb resolves it to canonical film/serial URL.
+                    Url = $"https://www.filmweb.pl/film?id={hit.Id.ToString(CultureInfo.InvariantCulture)}",
+                    FilmwebId = hit.Id.ToString(CultureInfo.InvariantCulture)
+                };
             }
         }
 
         return null;
     }
 
-    private async Task<FilmwebLookupResult?> TryParseRatingPageAsync(string url, string? fallbackFilmwebId, CancellationToken cancellationToken)
+    private async Task<FilmwebRating?> GetRatingAsync(int filmwebId, CancellationToken cancellationToken)
     {
-        var html = await GetStringWithThrottleAsync(url, cancellationToken, false).ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(html))
+        if (filmwebId <= 0)
         {
             return null;
         }
 
-        if (!TryExtractRating(html, out var rating, out var votes))
+        var ratingUrl = $"https://www.filmweb.pl/api/v1/film/{filmwebId.ToString(CultureInfo.InvariantCulture)}/rating";
+        var json = await GetStringWithThrottleAsync(ratingUrl, cancellationToken, true).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(json))
         {
             return null;
         }
 
-        var filmwebId = TryExtractFilmwebId(url) ?? NormalizeDigits(fallbackFilmwebId);
-        return new FilmwebLookupResult
+        try
         {
-            AverageRating = rating,
-            Votes = votes,
-            Url = url,
-            FilmwebId = filmwebId
-        };
+            var payload = JsonSerializer.Deserialize<FilmwebRating>(json, JsonOptions);
+            if (payload is null || payload.Rate <= 0)
+            {
+                return null;
+            }
+
+            return payload;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Filmweb rating JSON parse failed for id {FilmwebId}", filmwebId);
+            return null;
+        }
     }
 
     private async Task<string?> GetStringWithThrottleAsync(string url, CancellationToken cancellationToken, bool expectJson)
@@ -195,7 +201,8 @@ internal sealed class FilmwebClient
 
     private async Task<SearchHit?> SearchBestHitAsync(string contentType, string query, string? expectedTitle, CancellationToken cancellationToken)
     {
-        var searchUrl = $"https://www.filmweb.pl/api/v1/search?q={Uri.EscapeDataString(query)}";
+        var searchType = contentType == "movie" ? "film" : "serial";
+        var searchUrl = $"https://www.filmweb.pl/api/v1/search?q={Uri.EscapeDataString(query)}&type={Uri.EscapeDataString(searchType)}";
         var json = await GetStringWithThrottleAsync(searchUrl, cancellationToken, true).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(json))
         {
@@ -210,9 +217,8 @@ internal sealed class FilmwebClient
                 return null;
             }
 
-            var expectedType = contentType == "movie" ? "film" : "serial";
             var candidates = payload.SearchHits
-                .Where(h => h is not null && h.Id > 0 && string.Equals(h.Type, expectedType, StringComparison.OrdinalIgnoreCase))
+                .Where(h => h is not null && h.Id > 0 && string.Equals(h.Type, searchType, StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
             if (candidates.Count == 0)
@@ -245,131 +251,6 @@ internal sealed class FilmwebClient
             _logger.LogDebug(ex, "Filmweb search JSON parse failed for query '{Query}'", query);
             return null;
         }
-    }
-
-    private static bool TryExtractRating(string html, out double rating0To10, out int? votes)
-    {
-        rating0To10 = 0;
-        votes = null;
-
-        var dataRateMatch = DataRateRegex.Match(html);
-        if (dataRateMatch.Success && TryParseDouble(dataRateMatch.Groups["value"].Value, out var dataRate) && dataRate > 0)
-        {
-            rating0To10 = dataRate;
-            var dataCountMatch = DataCountRegex.Match(html);
-            if (dataCountMatch.Success && TryParseInt(dataCountMatch.Groups["value"].Value, out var dataVotes))
-            {
-                votes = dataVotes;
-            }
-            return true;
-        }
-
-        foreach (Match match in ScriptJsonLdRegex.Matches(html))
-        {
-            var json = (match.Groups["json"].Value ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(json))
-            {
-                continue;
-            }
-
-            if (TryExtractFromJsonLd(json, out rating0To10, out votes))
-            {
-                return true;
-            }
-        }
-
-        var ratingMatch = RatingValueFallbackRegex.Match(html);
-        if (ratingMatch.Success && TryParseDouble(ratingMatch.Groups["value"].Value, out var fallbackRating) && fallbackRating > 0)
-        {
-            rating0To10 = fallbackRating;
-            var votesMatch = RatingCountFallbackRegex.Match(html);
-            if (votesMatch.Success && TryParseInt(votesMatch.Groups["value"].Value, out var fallbackVotes))
-            {
-                votes = fallbackVotes;
-            }
-            return true;
-        }
-
-        return false;
-    }
-
-    private static bool TryExtractFromJsonLd(string json, out double rating0To10, out int? votes)
-    {
-        rating0To10 = 0;
-        votes = null;
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            if (!TryFindAggregateRating(doc.RootElement, out var ratingValue, out var ratingCount))
-            {
-                return false;
-            }
-
-            if (!ratingValue.HasValue || ratingValue.Value <= 0)
-            {
-                return false;
-            }
-
-            rating0To10 = ratingValue.Value;
-            votes = ratingCount > 0 ? ratingCount : null;
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool TryFindAggregateRating(JsonElement element, out double? ratingValue, out int ratingCount)
-    {
-        ratingValue = null;
-        ratingCount = 0;
-
-        if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-            {
-                if (TryFindAggregateRating(item, out ratingValue, out ratingCount))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        if (element.ValueKind != JsonValueKind.Object)
-        {
-            return false;
-        }
-
-        if (element.TryGetProperty("aggregateRating", out var agg) && agg.ValueKind == JsonValueKind.Object)
-        {
-            if (agg.TryGetProperty("ratingValue", out var rv))
-            {
-                ratingValue = ReadDouble(rv);
-            }
-
-            if (agg.TryGetProperty("ratingCount", out var rc))
-            {
-                ratingCount = ReadInt(rc);
-            }
-
-            if (ratingValue.HasValue && ratingValue.Value > 0)
-            {
-                return true;
-            }
-        }
-
-        foreach (var prop in element.EnumerateObject())
-        {
-            if (TryFindAggregateRating(prop.Value, out ratingValue, out ratingCount))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private static int ScoreTitleMatch(string expectedTitle, string? candidateTitle)
@@ -465,17 +346,6 @@ internal sealed class FilmwebClient
         return sb.ToString().Replace("  ", " ", StringComparison.Ordinal).Trim();
     }
 
-    private static string? TryExtractFilmwebId(string? url)
-    {
-        if (string.IsNullOrWhiteSpace(url))
-        {
-            return null;
-        }
-
-        var match = FilmwebIdRegex.Match(url.Trim());
-        return match.Success ? match.Groups["id"].Value : null;
-    }
-
     private sealed class SearchResponse
     {
         public List<SearchHit> SearchHits { get; set; } = new();
@@ -541,47 +411,9 @@ internal sealed class FilmwebClient
         return sb.Length == 0 ? null : sb.ToString();
     }
 
-    private static bool TryParseDouble(string? value, out double parsed)
+    private sealed class FilmwebRating
     {
-        parsed = 0;
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-
-        var normalized = value.Trim().Replace(',', '.');
-        return double.TryParse(normalized, NumberStyles.Any, CultureInfo.InvariantCulture, out parsed);
-    }
-
-    private static bool TryParseInt(string? value, out int parsed)
-    {
-        parsed = 0;
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-
-        var compact = value.Replace(" ", string.Empty, StringComparison.Ordinal).Trim();
-        return int.TryParse(compact, NumberStyles.Any, CultureInfo.InvariantCulture, out parsed);
-    }
-
-    private static double? ReadDouble(JsonElement el)
-    {
-        return el.ValueKind switch
-        {
-            JsonValueKind.Number => el.TryGetDouble(out var d) ? d : null,
-            JsonValueKind.String => TryParseDouble(el.GetString(), out var d2) ? d2 : null,
-            _ => null
-        };
-    }
-
-    private static int ReadInt(JsonElement el)
-    {
-        return el.ValueKind switch
-        {
-            JsonValueKind.Number => el.TryGetInt32(out var i) ? i : 0,
-            JsonValueKind.String => TryParseInt(el.GetString(), out var i2) ? i2 : 0,
-            _ => 0
-        };
+        public int Count { get; set; }
+        public double Rate { get; set; }
     }
 }
