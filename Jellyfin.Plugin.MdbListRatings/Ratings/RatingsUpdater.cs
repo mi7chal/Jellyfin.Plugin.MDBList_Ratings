@@ -27,6 +27,7 @@ internal sealed class RatingsUpdater
 
     private readonly ImdbRatingsDataset _imdbFallback;
     private readonly ImdbTop250Dataset _imdbTop250;
+    private readonly FilmwebClient _filmweb;
     private readonly TvMazeClient _tvMaze;
     private readonly TraktSeasonApiClient _traktSeason;
     private readonly TraktEpisodeApiClient _traktEpisode;
@@ -54,6 +55,7 @@ internal sealed class RatingsUpdater
         _client = new MdbListClient(httpClientFactory, logger);
         _imdbFallback = new ImdbRatingsDataset(httpClientFactory, cacheDir, logger);
         _imdbTop250 = new ImdbTop250Dataset(httpClientFactory, cacheDir, logger);
+        _filmweb = new FilmwebClient(httpClientFactory, logger);
         _tvMaze = new TvMazeClient(httpClientFactory, logger);
         _traktSeason = new TraktSeasonApiClient(httpClientFactory, logger);
         _traktEpisode = new TraktEpisodeApiClient(httpClientFactory, logger);
@@ -153,6 +155,10 @@ internal sealed class RatingsUpdater
         var effectiveSeasonFallback = NormalizeSource(effectiveForTransport.SeasonCommunityFallbackSource);
         var effectiveEpisodePrimary = NormalizeSource(effectiveForTransport.EpisodeCommunitySource);
         var effectiveEpisodeFallback = NormalizeSource(effectiveForTransport.EpisodeCommunityFallbackSource);
+        var effectiveMovieCommunityPrimary = NormalizeSource(effectiveForTransport.MovieCommunitySource);
+        var effectiveMovieCommunityFallback = NormalizeSource(effectiveForTransport.MovieCommunityFallbackSource);
+        var effectiveMovieCriticPrimary = NormalizeSource(effectiveForTransport.MovieCriticSource);
+        var effectiveMovieCriticFallback = NormalizeSource(effectiveForTransport.MovieCriticFallbackSource);
         // Always try to keep TVmaze cached for series/shows when an external id is available,
         // so the Web "all ratings from cache" panel can display it even if TVmaze is not the
         // selected primary/fallback source for metadata writing.
@@ -169,9 +175,13 @@ internal sealed class RatingsUpdater
             && (!string.IsNullOrWhiteSpace(seasonShowImdbId) || !string.IsNullOrWhiteSpace(seasonShowTvdbId));
         var needsEpisodeOmdb = isEpisode && seasonNumber.HasValue && episodeNumber.HasValue && EpisodeRequiresOmdb(effectiveEpisodePrimary, effectiveEpisodeFallback)
             && !string.IsNullOrWhiteSpace(imdbId);
-        var needsMdbList = !isSeason && !isEpisode && (isMovie || ShowRequiresMdbList(effectiveShowPrimary, effectiveShowFallback));
+        var needsMovieMdbList = isMovie && MovieRequiresMdbList(effectiveMovieCommunityPrimary, effectiveMovieCommunityFallback, effectiveMovieCriticPrimary, effectiveMovieCriticFallback);
+        var needsMdbList = !isSeason && !isEpisode && (needsMovieMdbList || (!isMovie && ShowRequiresMdbList(effectiveShowPrimary, effectiveShowFallback)));
+        var needsFilmweb = !isSeason && !isEpisode
+            && ((isMovie && MovieRequiresFilmweb(effectiveMovieCommunityPrimary, effectiveMovieCommunityFallback, effectiveMovieCriticPrimary, effectiveMovieCriticFallback))
+                || (!isMovie && ShowRequiresFilmweb(effectiveShowPrimary, effectiveShowFallback)));
 
-        if (!needsMdbList && !needsTvMaze && !needsSeasonTrakt && !needsSeasonTmdb && !needsEpisodeTmdb && !needsEpisodeTrakt && !needsEpisodeTvMaze && !needsEpisodeOmdb)
+        if (!needsMdbList && !needsTvMaze && !needsFilmweb && !needsSeasonTrakt && !needsSeasonTmdb && !needsEpisodeTmdb && !needsEpisodeTrakt && !needsEpisodeTvMaze && !needsEpisodeOmdb)
         {
             return UpdateOutcome.Skipped;
         }
@@ -254,7 +264,7 @@ internal sealed class RatingsUpdater
             ? await GetCachedOrFetchSeasonAsync(item, seasonShowTmdbId, seasonShowImdbId, seasonShowTvdbId, seasonNumber!.Value, cfg, needsSeasonTrakt, needsSeasonTmdb, cancellationToken).ConfigureAwait(false)
             : isEpisode
                 ? await GetCachedOrFetchEpisodeAsync(item, imdbId, seasonShowTmdbId, seasonShowImdbId, seasonShowTvdbId, seasonNumber!.Value, episodeNumber!.Value, cfg, effectiveEpisodePrimary, effectiveEpisodeFallback, needsEpisodeTmdb, needsEpisodeTrakt, needsEpisodeTvMaze, needsEpisodeOmdb, cancellationToken).ConfigureAwait(false)
-                : await GetCachedOrFetchAsync(contentType, tmdbId, imdbId, tvdbId, cfg, needsMdbList, needsTvMaze, cancellationToken).ConfigureAwait(false);
+                : await GetCachedOrFetchAsync(contentType, tmdbId, imdbId, tvdbId, cfg, needsMdbList, needsTvMaze, needsFilmweb, item.Name, item.ProductionYear, cancellationToken).ConfigureAwait(false);
         if (fetchResult.Outcome == UpdateOutcome.RateLimited)
         {
             return UpdateOutcome.RateLimited;
@@ -870,6 +880,27 @@ internal sealed class RatingsUpdater
         return RequiresMdbListSource(primary) || RequiresMdbListSource(fallback);
     }
 
+    private static bool ShowRequiresFilmweb(string primary, string fallback)
+    {
+        return RequiresFilmwebSource(primary) || RequiresFilmwebSource(fallback);
+    }
+
+    private static bool MovieRequiresMdbList(string communityPrimary, string communityFallback, string criticPrimary, string criticFallback)
+    {
+        return RequiresMdbListSource(communityPrimary)
+            || RequiresMdbListSource(communityFallback)
+            || RequiresMdbListSource(criticPrimary)
+            || RequiresMdbListSource(criticFallback);
+    }
+
+    private static bool MovieRequiresFilmweb(string communityPrimary, string communityFallback, string criticPrimary, string criticFallback)
+    {
+        return RequiresFilmwebSource(communityPrimary)
+            || RequiresFilmwebSource(communityFallback)
+            || RequiresFilmwebSource(criticPrimary)
+            || RequiresFilmwebSource(criticFallback);
+    }
+
     private static bool SeasonRequiresTrakt(string primary, string fallback)
     {
         return string.Equals(NormalizeSource(primary), "trakt", StringComparison.OrdinalIgnoreCase)
@@ -909,7 +940,12 @@ internal sealed class RatingsUpdater
     private static bool RequiresMdbListSource(string? source)
     {
         var s = NormalizeSource(source);
-        return !string.IsNullOrWhiteSpace(s) && s != "none" && s != "tvmaze";
+        return !string.IsNullOrWhiteSpace(s) && s != "none" && s != "tvmaze" && s != "filmweb";
+    }
+
+    private static bool RequiresFilmwebSource(string? source)
+    {
+        return string.Equals(NormalizeSource(source), "filmweb", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string? BuildCacheKey(string contentType, string? tmdbId, string? imdbId, string? tvdbId)
@@ -959,7 +995,7 @@ internal sealed class RatingsUpdater
         existing.Url = rating.Url;
     }
 
-    private static void EnsureIds(MdbListTitleResponse data, string? tmdbId, string? imdbId)
+    private static void EnsureIds(MdbListTitleResponse data, string? tmdbId, string? imdbId, string? filmwebId = null)
     {
         data.Ids ??= new MdbListIds();
 
@@ -971,6 +1007,11 @@ internal sealed class RatingsUpdater
         if (!data.Ids.Tmdb.HasValue && int.TryParse(tmdbId, out var tmdb))
         {
             data.Ids.Tmdb = tmdb;
+        }
+
+        if (string.IsNullOrWhiteSpace(data.Ids.Filmweb))
+        {
+            data.Ids.Filmweb = NormalizeDigits(filmwebId);
         }
     }
 
@@ -988,6 +1029,24 @@ internal sealed class RatingsUpdater
             Source = "tvmaze",
             Value = Math.Round(avg, 1, MidpointRounding.AwayFromZero),
             Score = Math.Round(avg * 10.0, 1, MidpointRounding.AwayFromZero),
+            Url = lookup.Url
+        };
+    }
+
+    private async Task<MdbListRating?> TryFetchFilmwebRatingAsync(string contentType, string? imdbId, string? title, int? year, TimeSpan ttl, CancellationToken cancellationToken)
+    {
+        var lookup = await _filmweb.LookupAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
+        if (lookup is null || lookup.AverageRating <= 0)
+        {
+            return null;
+        }
+
+        return new MdbListRating
+        {
+            Source = "filmweb",
+            Value = Math.Round(lookup.AverageRating, 1, MidpointRounding.AwayFromZero),
+            Score = Math.Round(lookup.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
+            Votes = lookup.Votes,
             Url = lookup.Url
         };
     }
@@ -1069,6 +1128,37 @@ internal sealed class RatingsUpdater
         }
 
         return sb.Length == 0 ? null : sb.ToString();
+    }
+
+    private static string? TryExtractFilmwebIdFromUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return null;
+        }
+
+        try
+        {
+            var normalized = url.Trim();
+            var dash = normalized.LastIndexOf('-', StringComparison.Ordinal);
+            if (dash < 0 || dash + 1 >= normalized.Length)
+            {
+                return null;
+            }
+
+            var candidate = normalized[(dash + 1)..];
+            var stop = candidate.IndexOfAny(new[] { '?', '#', '/' });
+            if (stop >= 0)
+            {
+                candidate = candidate[..stop];
+            }
+
+            return NormalizeDigits(candidate);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static float? TryExtractImdbFallbackCommunityRating(MdbListCacheStore.CacheEnvelope env)
@@ -1759,6 +1849,9 @@ internal sealed class RatingsUpdater
         PluginConfiguration cfg,
         bool needsMdbList,
         bool needsTvMaze,
+        bool needsFilmweb,
+        string? title,
+        int? year,
         CancellationToken cancellationToken)
     {
         var cacheKey = BuildCacheKey(contentType, tmdbId, imdbId, tvdbId);
@@ -1772,6 +1865,7 @@ internal sealed class RatingsUpdater
 
         async Task<FetchResult> ReturnFreshOrAugmentedCacheAsync(MdbListCacheStore.CacheEnvelope env)
         {
+            var changed = false;
             if (needsTvMaze && !HasRatingSource(env.Data, "tvmaze"))
             {
                 try
@@ -1781,14 +1875,37 @@ internal sealed class RatingsUpdater
                     {
                         EnsureIds(env.Data, tmdbId, imdbId);
                         UpsertRating(env.Data, tvmazeRating);
-                        env.CachedAtUtc = now;
-                        await _cacheStore.SaveAsync(cacheKey, env, cancellationToken).ConfigureAwait(false);
+                        changed = true;
                     }
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "TVMaze augmentation failed for {Key}", cacheKey);
                 }
+            }
+
+            if (needsFilmweb && !HasRatingSource(env.Data, "filmweb"))
+            {
+                try
+                {
+                    var filmwebRating = await TryFetchFilmwebRatingAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
+                    if (filmwebRating is not null)
+                    {
+                        EnsureIds(env.Data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRating.Url));
+                        UpsertRating(env.Data, filmwebRating);
+                        changed = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Filmweb augmentation failed for {Key}", cacheKey);
+                }
+            }
+
+            if (changed)
+            {
+                env.CachedAtUtc = now;
+                await _cacheStore.SaveAsync(cacheKey, env, cancellationToken).ConfigureAwait(false);
             }
 
             var imdbFallback = TryExtractImdbFallbackCommunityRating(env);
@@ -1889,6 +2006,42 @@ internal sealed class RatingsUpdater
                     }
                 }
 
+                if (needsFilmweb)
+                {
+                    try
+                    {
+                        var filmwebRating = await TryFetchFilmwebRatingAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
+                        if (filmwebRating is not null)
+                        {
+                            data ??= new MdbListTitleResponse
+                            {
+                                Type = contentType,
+                                Ids = new MdbListIds
+                                {
+                                    Imdb = NormalizeImdbId(imdbId),
+                                    Tmdb = int.TryParse(tmdbId, out var filmwebTmdbParsed) ? filmwebTmdbParsed : null
+                                }
+                            };
+
+                            EnsureIds(data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRating.Url));
+                            UpsertRating(data, filmwebRating);
+
+                            var filmwebOnlyEnv = new MdbListCacheStore.CacheEnvelope
+                            {
+                                CachedAtUtc = now,
+                                Data = data,
+                                RawJson = "{\"source\":\"filmweb-only\"}"
+                            };
+                            await _cacheStore.SaveAsync(cacheKey, filmwebOnlyEnv, cancellationToken).ConfigureAwait(false);
+                            return new FetchResult { Data = data, Outcome = UpdateOutcome.Skipped, StopAfterThis = stopAfterThis };
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Filmweb fallback failed for {Key}", cacheKey);
+                    }
+                }
+
                 if (api.StatusCode == 404 && !string.IsNullOrWhiteSpace(imdbId))
                 {
                     try
@@ -1960,11 +2113,34 @@ internal sealed class RatingsUpdater
             }
         }
 
+        if (needsFilmweb && !HasRatingSource(data, "filmweb"))
+        {
+            try
+            {
+                var filmwebRating = await TryFetchFilmwebRatingAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
+                if (filmwebRating is not null)
+                {
+                    EnsureIds(data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRating.Url));
+                    UpsertRating(data, filmwebRating);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Filmweb request failed for {Key}", cacheKey);
+            }
+        }
+
         var env = new MdbListCacheStore.CacheEnvelope
         {
             CachedAtUtc = now,
             Data = data,
-            RawJson = needsMdbList ? rawJson : "{\"source\":\"tvmaze-only\"}"
+            RawJson = needsMdbList
+                ? rawJson
+                : needsTvMaze && needsFilmweb
+                    ? "{\"source\":\"tvmaze-filmweb-only\"}"
+                    : needsFilmweb
+                        ? "{\"source\":\"filmweb-only\"}"
+                        : "{\"source\":\"tvmaze-only\"}"
         };
 
         await _cacheStore.SaveAsync(cacheKey, env, cancellationToken).ConfigureAwait(false);

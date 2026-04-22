@@ -132,6 +132,7 @@ internal static class WebUiInjector
       kinopoisk:          'https://cdn.jsdelivr.net/gh/Druidblack/jellyfin_ratings@main/logo/kinopoisk.png',
       myanimelist:        'https://cdn.jsdelivr.net/gh/Druidblack/jellyfin_ratings@main/logo/mal.png',
       anilist:            'https://cdn.jsdelivr.net/gh/Druidblack/jellyfin_ratings@main/logo/anilist.png',
+      filmweb:            asset('filmweb.svg'),
       tvmaze:             asset('tvmaze.png'),
       imdb_top_250:       asset('imdb_top_250.png')
     };
@@ -771,6 +772,7 @@ internal static class WebUiInjector
         letterboxd: 'Letterboxd',
         rogerebert: 'RogerEbert.com',
         anilist: 'AniList',
+        filmweb: 'Filmweb',
         tvmaze: 'TVmaze'
       };
       if (map[s]) return map[s];
@@ -907,6 +909,7 @@ internal static class WebUiInjector
 
         var rawUrl = rating ? (rating.url || rating.Url) : null;
         var url = normalizeLeadingSlash(rawUrl);
+        var filmwebId = ids.filmweb || ids.Filmweb || null;
 
         // IMDb
         if (src === 'imdb') {
@@ -922,6 +925,19 @@ internal static class WebUiInjector
           if (tvmazeUrl.indexOf('http://') === 0 || tvmazeUrl.indexOf('https://') === 0) return tvmazeUrl;
           if (tvmazeUrl.indexOf('/') === 0) return 'https://www.tvmaze.com' + tvmazeUrl;
           return 'https://www.tvmaze.com/' + tvmazeUrl.replace(/^\/+/, '');
+        }
+
+        // Filmweb
+        if (src === 'filmweb') {
+          if (rawUrl) {
+            var filmwebUrl = String(rawUrl).trim();
+            if (filmwebUrl.indexOf('http://') === 0 || filmwebUrl.indexOf('https://') === 0) return filmwebUrl;
+            if (filmwebUrl.indexOf('/') === 0) return 'https://www.filmweb.pl' + filmwebUrl;
+          }
+          if (filmwebId) {
+            return 'https://www.filmweb.pl/search?q=' + encodeURIComponent(String(filmwebId).trim());
+          }
+          return null;
         }
 
         // TMDb
