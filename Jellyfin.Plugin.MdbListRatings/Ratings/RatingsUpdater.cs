@@ -1140,7 +1140,7 @@ internal sealed class RatingsUpdater
         try
         {
             var normalized = url.Trim();
-            var dash = normalized.LastIndexOf('-', StringComparison.Ordinal);
+            var dash = normalized.LastIndexOf('-');
             if (dash < 0 || dash + 1 >= normalized.Length)
             {
                 return null;
