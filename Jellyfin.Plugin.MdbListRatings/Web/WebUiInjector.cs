@@ -132,7 +132,7 @@ internal static class WebUiInjector
       kinopoisk:          'https://cdn.jsdelivr.net/gh/Druidblack/jellyfin_ratings@main/logo/kinopoisk.png',
       myanimelist:        'https://cdn.jsdelivr.net/gh/Druidblack/jellyfin_ratings@main/logo/mal.png',
       anilist:            'https://cdn.jsdelivr.net/gh/Druidblack/jellyfin_ratings@main/logo/anilist.png',
-      filmweb:            asset('filmweb.svg'),
+      filmweb:            asset('filmweb_provider.png'),
       tvmaze:             asset('tvmaze.png'),
       imdb_top_250:       asset('imdb_top_250.png')
     };

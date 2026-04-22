@@ -177,9 +177,11 @@ internal sealed class RatingsUpdater
             && !string.IsNullOrWhiteSpace(imdbId);
         var needsMovieMdbList = isMovie && MovieRequiresMdbList(effectiveMovieCommunityPrimary, effectiveMovieCommunityFallback, effectiveMovieCriticPrimary, effectiveMovieCriticFallback);
         var needsMdbList = !isSeason && !isEpisode && (needsMovieMdbList || (!isMovie && ShowRequiresMdbList(effectiveShowPrimary, effectiveShowFallback)));
+        var needsFilmwebForWebPanel = cfg.EnableWebAllRatingsFromCache && !isSeason && !isEpisode;
         var needsFilmweb = !isSeason && !isEpisode
             && ((isMovie && MovieRequiresFilmweb(effectiveMovieCommunityPrimary, effectiveMovieCommunityFallback, effectiveMovieCriticPrimary, effectiveMovieCriticFallback))
-                || (!isMovie && ShowRequiresFilmweb(effectiveShowPrimary, effectiveShowFallback)));
+                || (!isMovie && ShowRequiresFilmweb(effectiveShowPrimary, effectiveShowFallback))
+                || needsFilmwebForWebPanel);
 
         if (!needsMdbList && !needsTvMaze && !needsFilmweb && !needsSeasonTrakt && !needsSeasonTmdb && !needsEpisodeTmdb && !needsEpisodeTrakt && !needsEpisodeTvMaze && !needsEpisodeOmdb)
         {

@@ -9,6 +9,14 @@
         "imageUrl": "https://raw.githubusercontent.com/Druidblack/Jellyfin.Plugin.MDBList_Ratings/main/images/logo.jpg",
         "versions": [
             {
+                "version": "1.0.0.9",
+                "changelog": "Fix Filmweb visibility in all-ratings cache mode and use custom filmweb_provider.png icon.",
+                "targetAbi": "10.11.0.0",
+                "sourceUrl": "https://raw.githubusercontent.com/mi7chal/Jellyfin.Plugin.MDBList_Ratings/feat/filmweb-provider/artifacts/Release-1.0.0.9.zip",
+                "checksum": "42bd29fe2bfd0d383b06825889223eb8",
+                "timestamp": "2026-04-22T20:18:50+00:00"
+            },
+            {
                 "version": "1.0.0.8",
                 "changelog": "Add Filmweb provider support for movies/shows with direct lookup and fallback-safe integration.",
                 "targetAbi": "10.11.0.0",
