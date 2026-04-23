@@ -17,6 +17,8 @@ internal sealed class FilmwebClient
     {
         public double AverageRating { get; init; }
         public int? Votes { get; init; }
+        public double? CriticRating { get; init; }
+        public int? CriticVotes { get; init; }
         public string? Url { get; init; }
         public string? FilmwebId { get; init; }
     }
@@ -83,11 +85,15 @@ internal sealed class FilmwebClient
             var rating = await GetRatingAsync(hit.Id, cancellationToken).ConfigureAwait(false);
             if (rating is not null)
             {
-                _logger.LogInformation("Filmweb API found item '{Title}' ({Id}) with rating {Rate} ({Count} votes)", hit.MatchedTitle, hit.Id, rating.Rate, rating.Count);
+                var criticRating = await GetCriticRatingAsync(hit.Id, cancellationToken).ConfigureAwait(false);
+
+                _logger.LogInformation("Filmweb API found item '{Title}' ({Id}) with rating {Rate} ({Count} votes) and critic rating {CriticRate} ({CriticCount} votes)", hit.MatchedTitle, hit.Id, rating.Rate, rating.Count, criticRating?.Rate, criticRating?.Count);
                 return new FilmwebLookupResult
                 {
                     AverageRating = rating.Rate,
                     Votes = rating.Count > 0 ? rating.Count : null,
+                    CriticRating = criticRating?.Rate > 0 ? criticRating.Rate : null,
+                    CriticVotes = criticRating?.Count > 0 ? criticRating.Count : null,
                     // Stable API-only URL form. Filmweb resolves it to canonical film/serial URL.
                     Url = $"https://www.filmweb.pl/film?id={hit.Id.ToString(CultureInfo.InvariantCulture)}",
                     FilmwebId = hit.Id.ToString(CultureInfo.InvariantCulture)
@@ -126,6 +132,38 @@ internal sealed class FilmwebClient
         catch (Exception ex)
         {
             _logger.LogError(ex, "Filmweb rating JSON parse failed for id {FilmwebId}", filmwebId);
+            return null;
+        }
+    }
+
+    private async Task<FilmwebRating?> GetCriticRatingAsync(int filmwebId, CancellationToken cancellationToken)
+    {
+        if (filmwebId <= 0)
+        {
+            return null;
+        }
+
+        var ratingUrl = $"https://www.filmweb.pl/api/v1/film/{filmwebId.ToString(CultureInfo.InvariantCulture)}/critics/rating";
+        var json = await GetStringWithThrottleAsync(ratingUrl, cancellationToken, true).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            var payload = JsonSerializer.Deserialize<FilmwebRating>(json, JsonOptions);
+            if (payload is null || payload.Rate <= 0)
+            {
+                _logger.LogDebug("Filmweb critic rating API returned empty or zero rate for id {FilmwebId}", filmwebId);
+                return null;
+            }
+
+            return payload;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Filmweb critic rating JSON parse failed for id {FilmwebId}", filmwebId);
             return null;
         }
     }

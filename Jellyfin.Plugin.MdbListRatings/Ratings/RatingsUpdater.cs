@@ -1037,22 +1037,39 @@ internal sealed class RatingsUpdater
         };
     }
 
-    private async Task<MdbListRating?> TryFetchFilmwebRatingAsync(string contentType, string? imdbId, string? title, int? year, TimeSpan ttl, CancellationToken cancellationToken)
+    private async Task<List<MdbListRating>> TryFetchFilmwebRatingsAsync(string contentType, string? imdbId, string? title, int? year, TimeSpan ttl, CancellationToken cancellationToken)
     {
         var lookup = await _filmweb.LookupAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
         if (lookup is null || lookup.AverageRating <= 0)
         {
-            return null;
+            return new List<MdbListRating>();
         }
 
-        return new MdbListRating
+        var results = new List<MdbListRating>
         {
-            Source = "filmweb",
-            Value = Math.Round(lookup.AverageRating, 1, MidpointRounding.AwayFromZero),
-            Score = Math.Round(lookup.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
-            Votes = lookup.Votes,
-            Url = lookup.Url
+            new MdbListRating
+            {
+                Source = "filmweb",
+                Value = Math.Round(lookup.AverageRating, 1, MidpointRounding.AwayFromZero),
+                Score = Math.Round(lookup.AverageRating * 10.0, 1, MidpointRounding.AwayFromZero),
+                Votes = lookup.Votes,
+                Url = lookup.Url
+            }
         };
+
+        if (lookup.CriticRating.HasValue && lookup.CriticRating.Value > 0)
+        {
+            results.Add(new MdbListRating
+            {
+                Source = "filmweb_critic",
+                Value = Math.Round(lookup.CriticRating.Value, 1, MidpointRounding.AwayFromZero),
+                Score = Math.Round(lookup.CriticRating.Value * 10.0, 1, MidpointRounding.AwayFromZero),
+                Votes = lookup.CriticVotes,
+                Url = lookup.Url
+            });
+        }
+
+        return results;
     }
 
     private async Task<MdbListRating?> TryFetchTvMazeEpisodeRatingAsync(string? imdbId, string? tvdbId, int seasonNumber, int episodeNumber, TimeSpan ttl, CancellationToken cancellationToken)
@@ -1909,11 +1926,14 @@ internal sealed class RatingsUpdater
             {
                 try
                 {
-                    var filmwebRating = await TryFetchFilmwebRatingAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
-                    if (filmwebRating is not null)
+                    var filmwebRatings = await TryFetchFilmwebRatingsAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
+                    if (filmwebRatings.Count > 0)
                     {
-                        EnsureIds(env.Data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRating.Url));
-                        UpsertRating(env.Data, filmwebRating);
+                        EnsureIds(env.Data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRatings[0].Url));
+                        foreach (var rating in filmwebRatings)
+                        {
+                            UpsertRating(env.Data, rating);
+                        }
                         changed = true;
                     }
                 }
@@ -2031,8 +2051,8 @@ internal sealed class RatingsUpdater
                 {
                     try
                     {
-                        var filmwebRating = await TryFetchFilmwebRatingAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
-                        if (filmwebRating is not null)
+                        var filmwebRatings = await TryFetchFilmwebRatingsAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
+                        if (filmwebRatings.Count > 0)
                         {
                             data ??= new MdbListTitleResponse
                             {
@@ -2044,8 +2064,11 @@ internal sealed class RatingsUpdater
                                 }
                             };
 
-                            EnsureIds(data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRating.Url));
-                            UpsertRating(data, filmwebRating);
+                            EnsureIds(data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRatings[0].Url));
+                            foreach (var rating in filmwebRatings)
+                            {
+                                UpsertRating(data, rating);
+                            }
 
                             var filmwebOnlyEnv = new MdbListCacheStore.CacheEnvelope
                             {
@@ -2138,11 +2161,14 @@ internal sealed class RatingsUpdater
         {
             try
             {
-                var filmwebRating = await TryFetchFilmwebRatingAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
-                if (filmwebRating is not null)
+                var filmwebRatings = await TryFetchFilmwebRatingsAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
+                if (filmwebRatings.Count > 0)
                 {
-                    EnsureIds(data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRating.Url));
-                    UpsertRating(data, filmwebRating);
+                    EnsureIds(data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRatings[0].Url));
+                    foreach (var rating in filmwebRatings)
+                    {
+                        UpsertRating(data, rating);
+                    }
                 }
             }
             catch (Exception ex)
