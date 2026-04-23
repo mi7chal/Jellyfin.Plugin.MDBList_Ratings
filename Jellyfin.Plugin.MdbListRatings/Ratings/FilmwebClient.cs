@@ -13,7 +13,7 @@ namespace Jellyfin.Plugin.MdbListRatings.Ratings;
 
 internal sealed class FilmwebClient
 {
-    internal sealed class FilmwebLookupResult
+    public sealed class FilmwebLookupResult
     {
         public double AverageRating { get; init; }
         public int? Votes { get; init; }
@@ -21,7 +21,7 @@ internal sealed class FilmwebClient
         public string? FilmwebId { get; init; }
     }
 
-    private sealed class CacheBox
+    public sealed class CacheBox
     {
         public DateTimeOffset CachedAtUtc { get; init; }
         public FilmwebLookupResult? Value { get; init; }
@@ -83,6 +83,7 @@ internal sealed class FilmwebClient
             var rating = await GetRatingAsync(hit.Id, cancellationToken).ConfigureAwait(false);
             if (rating is not null)
             {
+                _logger.LogInformation("Filmweb API found item '{Title}' ({Id}) with rating {Rate} ({Count} votes)", hit.MatchedTitle, hit.Id, rating.Rate, rating.Count);
                 return new FilmwebLookupResult
                 {
                     AverageRating = rating.Rate,
@@ -116,6 +117,7 @@ internal sealed class FilmwebClient
             var payload = JsonSerializer.Deserialize<FilmwebRating>(json, JsonOptions);
             if (payload is null || payload.Rate <= 0)
             {
+                _logger.LogWarning("Filmweb rating API returned empty or zero rate for id {FilmwebId}", filmwebId);
                 return null;
             }
 
@@ -123,7 +125,7 @@ internal sealed class FilmwebClient
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Filmweb rating JSON parse failed for id {FilmwebId}", filmwebId);
+            _logger.LogError(ex, "Filmweb rating JSON parse failed for id {FilmwebId}", filmwebId);
             return null;
         }
     }
@@ -214,6 +216,7 @@ internal sealed class FilmwebClient
             var payload = JsonSerializer.Deserialize<SearchResponse>(json, JsonOptions);
             if (payload?.SearchHits is null || payload.SearchHits.Count == 0)
             {
+                _logger.LogDebug("Filmweb search API returned no hits for query '{Query}'", query);
                 return null;
             }
 
@@ -223,6 +226,7 @@ internal sealed class FilmwebClient
 
             if (candidates.Count == 0)
             {
+                _logger.LogDebug("Filmweb search API returned no candidates of type '{Type}' for query '{Query}'", searchType, query);
                 return null;
             }
 
@@ -248,7 +252,7 @@ internal sealed class FilmwebClient
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Filmweb search JSON parse failed for query '{Query}'", query);
+            _logger.LogError(ex, "Filmweb search JSON parse failed for query '{Query}'", query);
             return null;
         }
     }
@@ -346,12 +350,12 @@ internal sealed class FilmwebClient
         return sb.ToString().Replace("  ", " ", StringComparison.Ordinal).Trim();
     }
 
-    private sealed class SearchResponse
+    public sealed class SearchResponse
     {
         public List<SearchHit> SearchHits { get; set; } = new();
     }
 
-    private sealed class SearchHit
+    public sealed class SearchHit
     {
         public int Id { get; set; }
         public string? Type { get; set; }
@@ -411,7 +415,7 @@ internal sealed class FilmwebClient
         return sb.Length == 0 ? null : sb.ToString();
     }
 
-    private sealed class FilmwebRating
+    public sealed class FilmwebRating
     {
         public int Count { get; set; }
         public double Rate { get; set; }
