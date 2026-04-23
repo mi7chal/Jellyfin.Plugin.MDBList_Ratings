@@ -13,8 +13,8 @@
                 "changelog": "Filmweb test build: direct provider support, all-ratings visibility fix, and custom filmweb_provider.png icon.",
                 "targetAbi": "10.11.0.0",
                 "sourceUrl": "https://raw.githubusercontent.com/mi7chal/Jellyfin.Plugin.MDBList_Ratings/feat/filmweb-provider/artifacts/Release-1.0.0.8.zip",
-                "checksum": "569a241b3d58892ce95789df7b2f7e9d",
-                "timestamp": "2026-04-23T11:43:00+00:00"
+                "checksum": "673c1b6f7cf66b10e1f74a5ec08f5596",
+                "timestamp": "2026-04-23T12:30:00+00:00"
             },
             {
                 "version": "1.0.0.7",
