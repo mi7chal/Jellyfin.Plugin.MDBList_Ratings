@@ -87,7 +87,7 @@ internal sealed class FilmwebClient
             {
                 var criticRating = await GetCriticRatingAsync(hit.Id, cancellationToken).ConfigureAwait(false);
 
-                _logger.LogInformation("Filmweb API found item '{Title}' ({Id}) with rating {Rate} ({Count} votes) and critic rating {CriticRate} ({CriticCount} votes)", hit.MatchedTitle, hit.Id, rating.Rate, rating.Count, criticRating?.Rate, criticRating?.Count);
+                _logger.LogDebug("Filmweb API found item '{Title}' ({Id}) with rating {Rate} ({Count} votes) and critic rating {CriticRate} ({CriticCount} votes)", hit.MatchedTitle, hit.Id, rating.Rate, rating.Count, criticRating?.Rate, criticRating?.Count);
                 return new FilmwebLookupResult
                 {
                     AverageRating = rating.Rate,

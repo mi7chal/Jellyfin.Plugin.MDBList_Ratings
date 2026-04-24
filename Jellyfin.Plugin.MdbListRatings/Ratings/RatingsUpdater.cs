@@ -1072,6 +1072,31 @@ internal sealed class RatingsUpdater
         return results;
     }
 
+    private async Task<bool> TryMergeFilmwebRatingsAsync(
+        MdbListTitleResponse data,
+        string contentType,
+        string? tmdbId,
+        string? imdbId,
+        string? title,
+        int? year,
+        TimeSpan ttl,
+        CancellationToken cancellationToken)
+    {
+        var filmwebRatings = await TryFetchFilmwebRatingsAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
+        if (filmwebRatings.Count == 0)
+        {
+            return false;
+        }
+
+        EnsureIds(data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRatings[0].Url));
+        foreach (var rating in filmwebRatings)
+        {
+            UpsertRating(data, rating);
+        }
+
+        return true;
+    }
+
     private async Task<MdbListRating?> TryFetchTvMazeEpisodeRatingAsync(string? imdbId, string? tvdbId, int seasonNumber, int episodeNumber, TimeSpan ttl, CancellationToken cancellationToken)
     {
         var lookup = await _tvMaze.LookupEpisodeAsync(imdbId, tvdbId, seasonNumber, episodeNumber, ttl, cancellationToken).ConfigureAwait(false);
@@ -1926,14 +1951,8 @@ internal sealed class RatingsUpdater
             {
                 try
                 {
-                    var filmwebRatings = await TryFetchFilmwebRatingsAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
-                    if (filmwebRatings.Count > 0)
+                    if (await TryMergeFilmwebRatingsAsync(env.Data, contentType, tmdbId, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false))
                     {
-                        EnsureIds(env.Data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRatings[0].Url));
-                        foreach (var rating in filmwebRatings)
-                        {
-                            UpsertRating(env.Data, rating);
-                        }
                         changed = true;
                     }
                 }
@@ -2051,25 +2070,18 @@ internal sealed class RatingsUpdater
                 {
                     try
                     {
-                        var filmwebRatings = await TryFetchFilmwebRatingsAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
-                        if (filmwebRatings.Count > 0)
+                        data ??= new MdbListTitleResponse
                         {
-                            data ??= new MdbListTitleResponse
+                            Type = contentType,
+                            Ids = new MdbListIds
                             {
-                                Type = contentType,
-                                Ids = new MdbListIds
-                                {
-                                    Imdb = NormalizeImdbId(imdbId),
-                                    Tmdb = int.TryParse(tmdbId, out var filmwebTmdbParsed) ? filmwebTmdbParsed : null
-                                }
-                            };
-
-                            EnsureIds(data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRatings[0].Url));
-                            foreach (var rating in filmwebRatings)
-                            {
-                                UpsertRating(data, rating);
+                                Imdb = NormalizeImdbId(imdbId),
+                                Tmdb = int.TryParse(tmdbId, out var filmwebTmdbParsed) ? filmwebTmdbParsed : null
                             }
+                        };
 
+                        if (await TryMergeFilmwebRatingsAsync(data, contentType, tmdbId, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false))
+                        {
                             var filmwebOnlyEnv = new MdbListCacheStore.CacheEnvelope
                             {
                                 CachedAtUtc = now,
@@ -2161,15 +2173,7 @@ internal sealed class RatingsUpdater
         {
             try
             {
-                var filmwebRatings = await TryFetchFilmwebRatingsAsync(contentType, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
-                if (filmwebRatings.Count > 0)
-                {
-                    EnsureIds(data, tmdbId, imdbId, TryExtractFilmwebIdFromUrl(filmwebRatings[0].Url));
-                    foreach (var rating in filmwebRatings)
-                    {
-                        UpsertRating(data, rating);
-                    }
-                }
+                await TryMergeFilmwebRatingsAsync(data, contentType, tmdbId, imdbId, title, year, ttl, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

@@ -9,14 +9,6 @@
         "imageUrl": "https://raw.githubusercontent.com/Druidblack/Jellyfin.Plugin.MDBList_Ratings/main/images/logo.jpg",
         "versions": [
             {
-                "version": "1.0.0.8",
-                "changelog": "Filmweb test build: direct provider support, all-ratings visibility fix, and custom filmweb_provider.png icon.",
-                "targetAbi": "10.11.0.0",
-                "sourceUrl": "https://raw.githubusercontent.com/mi7chal/Jellyfin.Plugin.MDBList_Ratings/feat/filmweb-provider/artifacts/Release-1.0.0.8.zip",
-                "checksum": "3e0c2f9efef3703e0fb39963122c8aaa",
-                "timestamp": "2026-04-24T11:20:00+00:00"
-            },
-            {
                 "version": "1.0.0.7",
                 "changelog": "fix [#9](https://github.com/Druidblack/Jellyfin.Plugin.MDBList_Ratings/issues/9)",
                 "targetAbi": "10.11.0.0",
